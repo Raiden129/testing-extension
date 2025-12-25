@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bato Image Auto-Fixer",
-  "version": "3.2",
+  "version": "3.1",
   "description": "Fixes broken images on Bato.to and all mirror sites automatically.",
   "permissions": [],
   "host_permissions": [
@@ -10,7 +10,17 @@
     "*://*.mbwbm.org/*",
     "*://*.mbznp.org/*",
     "*://*.mbqgu.org/*",
-    "*://*.bato.to/*"
+    "*://*.bato.to/*", 
+    "*://*.mpfip.org/*", 
+    "*://*.mpizz.org/*", 
+    "*://*.mpmok.org/*", 
+    "*://*.mpqom.org/*", 
+    "*://*.mpqsc.org/*", 
+    "*://*.mprnm.org/*", 
+    "*://*.mpubn.org/*", 
+    "*://*.mpujj.org/*", 
+    "*://*.mpvim.org/*", 
+    "*://*.mpypl.org/*"
   ],
   "content_scripts": [
     {
@@ -32,7 +42,8 @@
         "*://*.batocomic.com/*", "*://*.batocomic.net/*", "*://*.batocomic.org/*", 
         "*://*.readtoto.com/*", "*://*.readtoto.net/*", "*://*.readtoto.org/*", 
         "*://*.kuku.to/*", "*://*.okok.to/*", "*://*.ruru.to/*", "*://*.xdxd.to/*", 
-        "*://*.bato.si/*", "*://*.bato.ing/*"
+        "*://*.bato.si/*", "*://*.bato.ing/*", "*://*.mangapark.net/*", "*://*.mangapark.io/*",
+        "*://*.mangapark.com/*"
       ],
       "js": ["fixer.js"],
       "run_at": "document_idle"
