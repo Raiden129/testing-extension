@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bato Image Auto-Fixer",
-  "version": "3.1",
+  "version": "4",
   "description": "Fixes broken images on Bato.to and all mirror sites automatically.",
   "permissions": [],
   "host_permissions": [
@@ -58,3 +58,4 @@
     }
   }
 }
+
