@@ -32,6 +32,7 @@
   let failedCache = new Set(); 
   const processingImages = new WeakSet();
   let knownGoodServers = new Set();
+  let brokenImages = new WeakSet(); // Track known broken images
 
   // --- STORAGE HELPERS ---
   function loadFromStorage() {
@@ -221,9 +222,15 @@
         tld: successParsed.tld
       });
 
-      knownGoodServers.add(getServerSignature(
+      const newSig = getServerSignature(
         successParsed.prefix, successParsed.numberStr, successParsed.root, successParsed.tld
-      ));
+      );
+      
+      // Add to known good servers
+      knownGoodServers.add(newSig);
+      
+      // Try this new server on other broken images IMMEDIATELY
+      tryNewServerOnBrokenImages(newSig, img); // Skip the image we just fixed
       
       saveToStorage(); // PERSIST ON SUCCESS
     }
@@ -238,6 +245,117 @@
     img.dataset.batoFixing = "done";
     img.dataset.batoFixed = "true";
     processingImages.delete(img);
+    brokenImages.delete(img); // Remove from broken images set
+  }
+
+  // NEW FUNCTION: Immediately try new server on other broken images
+  function tryNewServerOnBrokenImages(newServerSig, skipImage = null) {
+    const [p, n, r, t] = newServerSig.split('|');
+    
+    // Find all broken images
+    document.querySelectorAll('img').forEach(img => {
+      // Skip if this is the image we just fixed
+      if (skipImage && img === skipImage) return;
+      
+      // Skip if already fixed or being processed
+      if (img.dataset.batoFixing === "done" || processingImages.has(img)) return;
+      
+      // Only try on images we know are broken
+      if (!brokenImages.has(img) && 
+          img.dataset.batoPreemptive !== "failed" && 
+          !(img.complete && img.naturalWidth === 0)) {
+        return;
+      }
+      
+      if (shouldIgnore(img.src)) return;
+
+      const parsed = parseSubdomain(img.src);
+      if (!parsed) return;
+      
+      // Skip if already same server
+      if (parsed.prefix === p && parsed.numberStr === n && parsed.root === r && parsed.tld === t) return;
+      
+      // Don't try if this server already failed for this image type
+      const cacheKey = `${r}-${parsed.path.split('/').slice(0, 3).join('/')}`;
+      if (serverCache.has(cacheKey)) {
+        const cached = serverCache.get(cacheKey);
+        if (cached.prefix === p && cached.number === n && cached.root === r && cached.tld === t) {
+          return; // Already in cache for this path
+        }
+      }
+      
+      // Don't try servers in failed cache
+      const serverPattern = `https://${p}${n}.${r}.${t}`;
+      if (failedCache.has(serverPattern)) return;
+      
+      // Construct the new URL
+      const newUrl = `https://${p}${n}.${r}.${t}${parsed.path}`;
+      
+      // Try it immediately without probing
+      console.log(`[BatoFixer] Trying newly learned server ${p}${n}.${r}.${t} on broken image`);
+      
+      // Mark as testing
+      img.dataset.batoTestingNewServer = newServerSig;
+      
+      // Save original if not already saved
+      if (!img.dataset.originalSrc) {
+        img.dataset.originalSrc = img.src;
+      }
+      
+      // Change the src
+      img.referrerPolicy = "no-referrer";
+      img.src = newUrl;
+      
+      if (img.srcset) {
+        if (!img.dataset.originalSrcset) {
+          img.dataset.originalSrcset = img.srcset;
+        }
+        const newSrcset = rewriteSrcset(img.srcset, newUrl);
+        if (newSrcset) img.srcset = newSrcset;
+      }
+      
+      // Set up error handler if this doesn't work
+      const errorHandler = function() {
+        if (img.dataset.batoTestingNewServer === newServerSig) {
+          img.removeEventListener('error', errorHandler);
+          img.dataset.batoTestingNewServer = "";
+          
+          // Revert to original
+          if (img.dataset.originalSrc) {
+            img.src = img.dataset.originalSrc;
+          }
+          if (img.dataset.originalSrcset) {
+            img.srcset = img.dataset.originalSrcset;
+          }
+          
+          // Add to failed cache for this server pattern
+          failedCache.add(serverPattern);
+        }
+      };
+      
+      img.addEventListener('error', errorHandler, { once: true });
+      
+      // Set up success handler
+      const loadHandler = function() {
+        if (img.dataset.batoTestingNewServer === newServerSig) {
+          img.removeEventListener('load', loadHandler);
+          img.dataset.batoTestingNewServer = "";
+          
+          // Mark as fixed
+          img.dataset.batoFixing = "done";
+          img.dataset.batoFixed = "true";
+          brokenImages.delete(img);
+          
+          // Add to known good servers (if not already)
+          knownGoodServers.add(newServerSig);
+          saveToStorage();
+          
+          console.log(`[BatoFixer] New server worked for broken image!`);
+        }
+      };
+      
+      img.addEventListener('load', loadHandler, { once: true });
+    });
   }
 
   async function fixImage(img, isRetry = false) {
@@ -353,6 +471,9 @@
     if (shouldIgnore(img.src)) return;
 
     if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth === 0) {
+      // Mark as broken
+      brokenImages.add(img);
+      
       if (img.dataset.originalSrc) {
         img.src = img.dataset.originalSrc;
         if (img.dataset.originalSrcset) img.srcset = img.dataset.originalSrcset;
@@ -363,6 +484,8 @@
     }
     
     if (img.complete && img.naturalWidth === 0 && img.dataset.batoFixing !== "done") {
+      // Mark as broken
+      brokenImages.add(img);
       fixImage(img);
     }
   }
@@ -385,6 +508,8 @@
       
       setTimeout(() => {
         if (img.dataset.batoFixing !== "done") {
+          // Mark as broken
+          brokenImages.add(img);
           fixImage(img);
         }
       }, 100);
@@ -395,6 +520,7 @@
     // 1. Load data from previous sessions
     loadFromStorage();
 
+    // Enhanced load event listener
     document.addEventListener('load', (e) => {
         if (e.target.tagName === 'IMG') {
             if (shouldIgnore(e.target.src)) return;
@@ -405,11 +531,15 @@
                 if (!knownGoodServers.has(sig)) {
                     knownGoodServers.add(sig);
                     saveToStorage(); // PERSIST DISCOVERY
+                    
+                    // NEW: Immediately try this new server on broken images
+                    tryNewServerOnBrokenImages(sig);
                 }
             }
         }
     }, true);
 
+    // Check all existing images
     document.querySelectorAll('img').forEach(img => {
       processNewImage(img);
       setTimeout(() => checkImage(img), 1000);
