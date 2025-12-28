@@ -7,6 +7,7 @@
         MAX_CONCURRENT_PROBES: 12,
         CACHE_LIMIT: 2000,
         FAILED_CACHE_LIMIT: 5000,
+        MAX_RETRIES_PER_IMAGE: 1,
         DEBUG: false,  // Set to true for detailed console logs
         STORAGE_KEY_CACHE: 'bato_fixer_cache_v8',
         STORAGE_KEY_CONTEXT: 'bato_fixer_context_v8'
@@ -67,17 +68,18 @@
 
     // --- Logging ---
     function log(...args) {
-        if (CONFIG.DEBUG) console.log('%c[BatoFixer]', 'color: #ff6b35; font-weight: bold;', ...args);
+        if (!CONFIG.DEBUG) return;
+        console.debug('[BatoFixer]', ...args);
     }
     function logInfo(img, msg) {
         if (!CONFIG.DEBUG) return;
         const shortSrc = img?.src ? img.src.split('/').slice(-3).join('/') : 'unknown';
-        console.log(`%c[Info] ${msg}`, 'color: #4caf50;', shortSrc, img);
+        console.info('[BatoFixer][INFO]', msg, shortSrc);
     }
     function logWarn(img, msg) {
         if (!CONFIG.DEBUG) return;
         const shortSrc = img?.src ? img.src.split('/').slice(-3).join('/') : 'unknown';
-        console.warn(`[Warn] ${msg}`, shortSrc, img);
+        console.warn('[BatoFixer][WARN]', msg, shortSrc);
     }
 
     // --- Storage ---
@@ -127,6 +129,15 @@
     }
 
     // --- Helpers ---
+    function getStatus(img) {
+        return img.dataset.batoStatus || '';
+    }
+
+    function setStatus(img, status) {
+        if (status) img.dataset.batoStatus = status;
+        else delete img.dataset.batoStatus;
+    }
+
     function isBatoImage(src) {
         return src && BATO_PATTERN.test(src);
     }
@@ -165,7 +176,14 @@
 
         const sig = getServerSignature(prefix, numberStr, root, tld);
         const host = `${prefix}${numberStr}.${root}.${tld}`;
-        if (knownGoodServers.has(sig)) knownGoodServers.delete(sig); // LRU touch
+        const isNew = !knownGoodServers.has(sig);
+        if (!isNew) {
+            // LRU touch: move to the end without logging
+            knownGoodServers.delete(sig);
+            knownGoodServers.add(sig);
+            return;
+        }
+
         knownGoodServers.add(sig);
         log('Registered good server:', host, `(total: ${knownGoodServers.size})`);
         markStorageDirty();
@@ -182,6 +200,7 @@
         }
 
         img.dataset.batoQueued = priority;
+        setStatus(img, 'queued');
         processingQueue[priority].push(img);
         logInfo(img, `Queued as ${priority}`);
         processQueue();
@@ -190,7 +209,7 @@
     async function processQueue() {
         if (processingQueue.isProcessing) return;
         processingQueue.isProcessing = true;
-        log('Starting queue processing...');
+        log('queue:start');
 
         while (processingQueue.high.length > 0 || processingQueue.low.length > 0) {
             const batch = [];
@@ -210,13 +229,13 @@
 
             if (batch.length === 0) break;
 
-            log(`Processing batch of ${batch.length} images`);
+            log('queue:batch', { size: batch.length });
             batch.forEach(img => fixImage(img));
             await new Promise(r => setTimeout(r, 50));
         }
 
         processingQueue.isProcessing = false;
-        log('Queue processing finished');
+        log('queue:done');
     }
 
     // --- Probing Logic ---
@@ -229,7 +248,7 @@
 
         await globalLimiter.acquire();
         perf.probesMade++;
-        log(`Probing: ${hostKey}`);
+        log('probe:start', hostKey);
 
         try {
             return await new Promise((resolve, reject) => {
@@ -238,18 +257,20 @@
                 let timer = setTimeout(() => {
                     img.src = '';
                     failedCache.add(hostKey);
-                    log('Probe timeout:', hostKey);
+                    if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
+                    log('probe:timeout', hostKey);
                     reject('timeout');
                 }, CONFIG.PROBE_TIMEOUT);
 
                 img.onload = () => {
                     clearTimeout(timer);
                     if (img.width > 1) {
-                        log('%cProbe success!', 'color: #4caf50; font-weight: bold;', hostKey);
+                        log('probe:success', hostKey);
                         resolve(url);
                     } else {
                         failedCache.add(hostKey);
-                        log('Probe empty image:', hostKey);
+                        if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
+                        log('probe:empty', hostKey);
                         reject('empty');
                     }
                 };
@@ -257,7 +278,8 @@
                 img.onerror = () => {
                     clearTimeout(timer);
                     failedCache.add(hostKey);
-                    log('Probe error:', hostKey);
+                    if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
+                    log('probe:error', hostKey);
                     reject('error');
                 };
 
@@ -269,7 +291,7 @@
     }
 
     function findFastestCandidate(candidates) {
-        log(`Finding fastest among ${candidates.length} candidates`);
+        log('candidate:race', { count: candidates.length });
         if (candidates.length === 0) return Promise.reject('No candidates');
 
         return new Promise((resolve, reject) => {
@@ -288,7 +310,7 @@
                 probeSingle(url).then(validUrl => {
                     if (!resolved) {
                         resolved = true;
-                        log('%cWinner found!', 'color: #ffeb3b; background: #333; font-weight: bold;', hostKey);
+                        log('candidate:winner', hostKey);
                         resolve(validUrl);
                     }
                 }).catch(() => {
@@ -320,7 +342,7 @@
         if (pathKey && serverCache.has(pathKey)) {
             const c = serverCache.get(pathKey);
             add(c.prefix, c.number, c.root, c.tld, 0);
-            log('Cache hit:', pathKey, '→', `${c.prefix}${c.number}.${c.root}.${c.tld}`);
+            log('cache:hit', { key: pathKey, host: `${c.prefix}${c.number}.${c.root}.${c.tld}` });
         }
 
         // 3. Heuristics
@@ -335,7 +357,7 @@
             .map(c => c.url)
             .slice(0, CONFIG.MAX_ATTEMPTS);
 
-        log(`Generated ${final.length} candidates (top 5):`, cand.slice(0,5).map(c => c.host));
+        log('candidate:list', { count: final.length, sample: cand.slice(0,5).map(c => c.host) });
         return final;
     }
 
@@ -344,7 +366,7 @@
         if (!ok) return;
 
         const host = `${ok.prefix}${ok.numberStr}.${ok.root}.${ok.tld}`;
-        log('%cFixed image!', 'color: #4caf50; font-weight: bold;', host);
+        log('fix:applied', host);
 
         const pathKey = getCacheKeyFromSrc(img.dataset.originalSrc || img.src);
         if (pathKey) {
@@ -360,6 +382,7 @@
 
         img.dataset.batoFixing = 'done';
         img.dataset.batoFixed = 'true';
+        setStatus(img, 'done');
         delete img.dataset.batoFixStart;
         brokenImageRegistry.delete(img);
 
@@ -372,40 +395,47 @@
 
             if (!otherImg.dataset.originalSrc) otherImg.dataset.originalSrc = otherImg.src;
             otherImg.dataset.batoFixing = 'broadcasting';
+            setStatus(otherImg, 'broadcast');
 
             otherImg.addEventListener('error', function onFail() {
                 otherImg.dataset.batoFixing = 'failed';
-                logWarn(otherImg, 'Broadcast failed → requeue');
+                setStatus(otherImg, 'failed');
+                logWarn(otherImg, 'broadcast:error');
                 addToQueue(otherImg, 'high');
             }, { once: true });
 
             otherImg.addEventListener('load', function onSuccess() {
                 if (otherImg.naturalWidth > 0) {
                     otherImg.dataset.batoFixing = 'done';
+                    setStatus(otherImg, 'done');
                     brokenImageRegistry.delete(otherImg);
                     perf.broadcastSuccess++;
-                    logInfo(otherImg, 'Broadcast success');
+                    logInfo(otherImg, 'broadcast:success');
                 }
             }, { once: true });
 
+            otherImg.referrerPolicy = 'no-referrer';
             otherImg.src = `https://${host}${p.path}`;
             broadcastCount++;
         });
 
-        if (broadcastCount > 0) log(`Broadcasting fix to ${broadcastCount} images`);
+        if (broadcastCount > 0) log('broadcast:start', { count: broadcastCount });
     }
 
     async function fixImage(img) {
-        if (img.dataset.batoFixing === 'true' || img.dataset.batoFixing === 'done') return;
+        const status = getStatus(img);
+        if (status === 'probing' || status === 'preemptive' || status === 'broadcast' || status === 'done') return;
 
-        logInfo(img, 'Starting full fix');
+        logInfo(img, 'fix:start');
         img.dataset.batoFixing = 'true';
+        setStatus(img, 'probing');
         img.dataset.batoFixStart = Date.now().toString();
 
         const parsed = parseSubdomain(img.src);
         if (!parsed) {
             img.dataset.batoFixing = 'failed';
-            logWarn(img, 'Parse failed');
+            setStatus(img, 'failed');
+            logWarn(img, 'fix:parse-failed');
             return;
         }
 
@@ -415,13 +445,17 @@
             applyFix(img, winner);
         } catch (e) {
             img.dataset.batoFixing = 'failed';
+            setStatus(img, 'failed');
             perf.failures++;
-            logWarn(img, 'All probes failed');
+            logWarn(img, 'fix:all-probes-failed');
         }
     }
 
     function preemptiveFix(img) {
+        const currentStatus = getStatus(img);
+        if (currentStatus && currentStatus !== 'failed') return false;
         if (knownGoodServers.size === 0) return false;
+        if (shouldIgnore(img.src)) return false;
         const parsed = parseSubdomain(img.src);
         if (!parsed) return false;
 
@@ -433,14 +467,20 @@
         const newUrl = `https://${p}${n}.${r}.${t}${parsed.path}`;
         const host = `${p}${n}.${r}.${t}`;
 
-        logInfo(img, `Preemptive fix → ${host}`);
+        logInfo(img, `preemptive:start → ${host}`);
         img.dataset.originalSrc = img.src;
         img.dataset.batoPreemptive = 'true';
+        img.dataset.batoFixing = 'true';
+        setStatus(img, 'preemptive');
         img.referrerPolicy = 'no-referrer';
 
         const slowTimer = setTimeout(() => {
             if (img.dataset.batoPreemptive === 'true' && !img.complete) {
-                logWarn(img, 'Preemptive slow → full fix');
+                logWarn(img, 'preemptive:slow');
+                img.src = img.dataset.originalSrc;
+                img.dataset.batoPreemptive = 'failed';
+                img.dataset.batoFixing = '';
+                setStatus(img, 'queued');
                 addToQueue(img, 'high');
             }
         }, 1500);
@@ -451,8 +491,10 @@
             cleanup();
             img.src = img.dataset.originalSrc;
             img.dataset.batoPreemptive = 'failed';
+            img.dataset.batoFixing = '';
+            setStatus(img, 'queued');
             perf.preemptiveFail++;
-            logWarn(img, 'Preemptive failed');
+            logWarn(img, 'preemptive:error');
             addToQueue(img, 'high');
         }, { once: true });
 
@@ -461,10 +503,19 @@
             if (img.naturalWidth > 0) {
                 img.dataset.batoPreemptive = '';
                 img.dataset.batoFixing = 'done';
+                setStatus(img, 'done');
                 perf.preemptiveSuccess++;
                 perf.successes++;
-                logInfo(img, 'Preemptive success!');
-                registerGoodServer({ prefix: p, numberStr: n, root: r, tld: t });
+                logInfo(img, 'preemptive:success');
+                const ok = { prefix: p, numberStr: n, root: r, tld: t };
+                registerGoodServer(ok);
+                const pathKey = getCacheKeyFromSrc(img.dataset.originalSrc || img.src);
+                if (pathKey) {
+                    serverCache.set(pathKey, { prefix: ok.prefix, number: ok.numberStr, root: ok.root, tld: ok.tld });
+                    markStorageDirty();
+                }
+                delete img.dataset.batoFixStart;
+                brokenImageRegistry.delete(img);
             } else {
                 img.dispatchEvent(new Event('error'));
             }
@@ -475,15 +526,15 @@
     }
 
     function init() {
-        log('%cBatoFixer v8 (Fixes ALL bato CDN images - thumbs, avatars, covers, panels)', 'font-size: 16px; color: #ff6b35; font-weight: bold;');
+        log('init', 'BatoFixer v8 (Fixes ALL bato CDN images - thumbs, avatars, covers, panels)');
         loadFromStorage();
 
         // Harvest good servers from any successful load
         document.addEventListener('load', e => {
-            if (e.target.tagName === 'IMG' && isBatoImage(e.target.src) && e.target.naturalWidth > 0) {
+            if (e.target.tagName === 'IMG' && !shouldIgnore(e.target.src) && e.target.naturalWidth > 0) {
                 const p = parseSubdomain(e.target.src);
                 if (p) {
-                    logInfo(e.target, 'Harvested good server');
+                    logInfo(e.target, 'server:harvest');
                     registerGoodServer(p);
                 }
             }
@@ -491,11 +542,11 @@
 
         // Initial scan
         document.querySelectorAll('img').forEach(img => {
-            if (!isBatoImage(img.src)) return;
+            if (shouldIgnore(img.src)) return;
 
             if (img.complete) {
                 if (img.naturalWidth === 0) {
-                    logWarn(img, 'Broken on load → queue');
+                    logWarn(img, 'img:broken-on-load');
                     addToQueue(img, 'high');
                 } else {
                     const p = parseSubdomain(img.src);
@@ -514,13 +565,12 @@
         // Dynamic content
         new MutationObserver(mutations => {
             mutations.forEach(m => m.addedNodes.forEach(n => {
-                if (n.tagName === 'IMG' && isBatoImage(n.src)) {
+                if (n.tagName === 'IMG' && !shouldIgnore(n.src)) {
                     if (!n.complete) n.addEventListener('error', () => addToQueue(n, 'high'), { once: true });
                     if (knownGoodServers.size > 0) preemptiveFix(n);
-                }
-                if (n.querySelectorAll) {
+                } else if (n.querySelectorAll) {
                     n.querySelectorAll('img').forEach(i => {
-                        if (isBatoImage(i.src) && !i.complete) {
+                        if (!shouldIgnore(i.src) && !i.complete) {
                             i.addEventListener('error', () => addToQueue(i, 'high'), { once: true });
                             if (knownGoodServers.size > 0) preemptiveFix(i);
                         }
@@ -532,17 +582,28 @@
         // Cleanup & stats
         setInterval(() => {
             const now = Date.now();
-            document.querySelectorAll('[data-bato-fixing="true"]').forEach(img => {
+            document.querySelectorAll('[data-bato-status="probing"], [data-bato-status="preemptive"], [data-bato-status="broadcast"]').forEach(img => {
                 if ((now - parseInt(img.dataset.batoFixStart || 0)) > 20000) {
-                    logWarn(img, 'Fix hung >20s → failed');
-                    img.dataset.batoFixing = 'failed';
-                    brokenImageRegistry.add(img);
+                    const retries = parseInt(img.dataset.batoRetries || '0', 10) || 0;
+                    if (retries < CONFIG.MAX_RETRIES_PER_IMAGE) {
+                        img.dataset.batoRetries = String(retries + 1);
+                        logWarn(img, `watchdog:retry-${retries + 1}`);
+                        img.dataset.batoFixing = '';
+                        setStatus(img, 'queued');
+                        img.dataset.batoFixStart = Date.now().toString();
+                        addToQueue(img, 'high');
+                    } else {
+                        logWarn(img, 'watchdog:failed');
+                        img.dataset.batoFixing = 'failed';
+                        setStatus(img, 'failed');
+                        brokenImageRegistry.add(img);
+                    }
                 }
             });
             if (storageDirty) saveToStorage();
 
             if (CONFIG.DEBUG && perf.probesMade % 50 === 0 && perf.probesMade > 0) {
-                log('Stats:', {
+                log('stats', {
                     successes: perf.successes,
                     failures: perf.failures,
                     probes: perf.probesMade,
