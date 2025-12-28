@@ -7,9 +7,9 @@
         MAX_CONCURRENT_PROBES: 12,
         CACHE_LIMIT: 2000,
         FAILED_CACHE_LIMIT: 5000,
-        DEBUG: false,  // ←←← SET TO true FOR DETAILED LOGS ←←←
-        STORAGE_KEY_CACHE: 'bato_fixer_cache_v7',
-        STORAGE_KEY_CONTEXT: 'bato_fixer_context_v7'
+        DEBUG: false,  // Set to true for detailed console logs
+        STORAGE_KEY_CACHE: 'bato_fixer_cache_v8',
+        STORAGE_KEY_CONTEXT: 'bato_fixer_context_v8'
     };
 
     const FALLBACK_PREFIXES = ['n', 'x', 't', 's', 'w', 'm', 'c', 'u', 'k'];
@@ -25,8 +25,9 @@
         'googlesyndication', 'monetix', '/ads/', 'googleapis.com'
     ];
 
+    // Broad pattern: matches any image on letter+number.domain.tld (any path)
     const SUBDOMAIN_RE = /^https?:\/\/([a-z]+)(\d+)\.([a-z0-9\-]+)\.([a-z]{2,})(\/.*)$/i;
-    const BATO_PATTERN = /^https?:\/\/[a-z]+\d+\.[a-z0-9\-]+\.[a-z]{2,}\/media\//i;
+    const BATO_PATTERN = /^https?:\/\/[a-z]+\d+\.[a-z0-9\-]+\.[a-z]{2,}\/?/i;
 
     // --- State Management ---
     let serverCache = new Map();
@@ -34,16 +35,26 @@
     let knownGoodServers = new Set();
     const brokenImageRegistry = new Set();
 
-    // --- Concurrency & Queue ---
+    // --- Concurrency Control ---
     class Semaphore {
-        constructor(max) { this.max = max; this.counter = 0; this.queue = []; }
+        constructor(max) {
+            this.max = max;
+            this.counter = 0;
+            this.queue = [];
+        }
         async acquire() {
-            if (this.counter < this.max) { this.counter++; return; }
+            if (this.counter < this.max) {
+                this.counter++;
+                return Promise.resolve();
+            }
             return new Promise(resolve => this.queue.push(resolve));
         }
         release() {
             this.counter--;
-            if (this.queue.length > 0) { this.counter++; this.queue.shift()(); }
+            if (this.queue.length > 0) {
+                this.counter++;
+                this.queue.shift()();
+            }
         }
     }
     const globalLimiter = new Semaphore(CONFIG.MAX_CONCURRENT_PROBES);
@@ -54,18 +65,18 @@
 
     const perf = { successes: 0, failures: 0, probesMade: 0, preemptiveSuccess: 0, preemptiveFail: 0, broadcastSuccess: 0 };
 
-    // --- Enhanced Logging ---
+    // --- Logging ---
     function log(...args) {
         if (CONFIG.DEBUG) console.log('%c[BatoFixer]', 'color: #ff6b35; font-weight: bold;', ...args);
     }
     function logInfo(img, msg) {
         if (!CONFIG.DEBUG) return;
-        const shortSrc = img.src?.split('/').slice(-3).join('/') || 'unknown';
+        const shortSrc = img?.src ? img.src.split('/').slice(-3).join('/') : 'unknown';
         console.log(`%c[Info] ${msg}`, 'color: #4caf50;', shortSrc, img);
     }
     function logWarn(img, msg) {
         if (!CONFIG.DEBUG) return;
-        const shortSrc = img.src?.split('/').slice(-3).join('/') || 'unknown';
+        const shortSrc = img?.src ? img.src.split('/').slice(-3).join('/') : 'unknown';
         console.warn(`[Warn] ${msg}`, shortSrc, img);
     }
 
@@ -116,7 +127,9 @@
     }
 
     // --- Helpers ---
-    function isBatoImage(src) { return src && BATO_PATTERN.test(src); }
+    function isBatoImage(src) {
+        return src && BATO_PATTERN.test(src);
+    }
 
     function shouldIgnore(src) {
         if (!src || !isBatoImage(src)) return true;
@@ -140,9 +153,8 @@
     function getCacheKeyFromSrc(src) {
         const parsed = parseSubdomain(src);
         if (!parsed) return null;
-        const mediaIndex = parsed.path.indexOf('/media/');
-        if (mediaIndex === -1) return null;
-        return `${parsed.root}-${parsed.path.substring(mediaIndex).split('/').slice(0, 4).join('/')}`;
+        const pathParts = parsed.path.split('/').filter(Boolean).slice(0, 3).join('/');
+        return `${parsed.root}-${pathParts}`;
     }
 
     function registerGoodServer(input) {
@@ -153,7 +165,7 @@
 
         const sig = getServerSignature(prefix, numberStr, root, tld);
         const host = `${prefix}${numberStr}.${root}.${tld}`;
-        if (knownGoodServers.has(sig)) knownGoodServers.delete(sig);
+        if (knownGoodServers.has(sig)) knownGoodServers.delete(sig); // LRU touch
         knownGoodServers.add(sig);
         log('Registered good server:', host, `(total: ${knownGoodServers.size})`);
         markStorageDirty();
@@ -161,14 +173,7 @@
 
     // --- Queue System ---
     function addToQueue(img, priority = 'low') {
-        if (shouldIgnore(img.src)) {
-            logInfo(img, 'Ignored (not bato image or ad)');
-            return;
-        }
-        if (img.dataset.batoQueued) {
-            logInfo(img, 'Already queued, skipping');
-            return;
-        }
+        if (shouldIgnore(img.src) || img.dataset.batoQueued) return;
 
         brokenImageRegistry.add(img);
         if (priority === 'auto') {
@@ -178,7 +183,7 @@
 
         img.dataset.batoQueued = priority;
         processingQueue[priority].push(img);
-        logInfo(img, `Queued as ${priority} (queue: high=${processingQueue.high.length}, low=${processingQueue.low.length})`);
+        logInfo(img, `Queued as ${priority}`);
         processQueue();
     }
 
@@ -244,7 +249,7 @@
                         resolve(url);
                     } else {
                         failedCache.add(hostKey);
-                        log('Probe empty image (1x1?):', hostKey);
+                        log('Probe empty image:', hostKey);
                         reject('empty');
                     }
                 };
@@ -268,7 +273,7 @@
         if (candidates.length === 0) return Promise.reject('No candidates');
 
         return new Promise((resolve, reject) => {
-            let active = 0, index = 0, resolved = false, failures = 0;
+            let active = 0, index = 0, resolved = false;
 
             const spawn = () => {
                 if (resolved || index >= candidates.length) {
@@ -277,7 +282,7 @@
                 }
                 const url = candidates[index++];
                 const hostKey = url.split('/').slice(0, 3).join('/');
-                if (failedCache.has(hostKey)) { failures++; spawn(); return; }
+                if (failedCache.has(hostKey)) { spawn(); return; }
 
                 active++;
                 probeSingle(url).then(validUrl => {
@@ -288,7 +293,6 @@
                     }
                 }).catch(() => {
                     active--;
-                    failures++;
                     spawn();
                 });
             };
@@ -305,13 +309,13 @@
             cand.push({ url, p: prio, host: `${p}${String(n).padStart(2, '0')}.${r}.${t}` });
         };
 
-        // 1. Known good
+        // 1. Known good servers (highest priority)
         Array.from(knownGoodServers).reverse().forEach((sig, i) => {
             const [p, n, r, t] = sig.split('|');
             if (p !== parsed.prefix || n !== parsed.numberStr) add(p, n, r, t, -1 + (i * 0.01));
         });
 
-        // 2. Cache
+        // 2. Per-path cache
         const pathKey = getCacheKeyFromSrc(`https://${parsed.prefix}${parsed.numberStr}.${parsed.root}.${parsed.tld}${parsed.path}`);
         if (pathKey && serverCache.has(pathKey)) {
             const c = serverCache.get(pathKey);
@@ -331,7 +335,7 @@
             .map(c => c.url)
             .slice(0, CONFIG.MAX_ATTEMPTS);
 
-        log(`Generated ${final.length} candidates (top 5 hosts):`, cand.slice(0,5).map(c => c.host));
+        log(`Generated ${final.length} candidates (top 5):`, cand.slice(0,5).map(c => c.host));
         return final;
     }
 
@@ -342,7 +346,6 @@
         const host = `${ok.prefix}${ok.numberStr}.${ok.root}.${ok.tld}`;
         log('%cFixed image!', 'color: #4caf50; font-weight: bold;', host);
 
-        // Cache & register
         const pathKey = getCacheKeyFromSrc(img.dataset.originalSrc || img.src);
         if (pathKey) {
             serverCache.set(pathKey, { prefix: ok.prefix, number: ok.numberStr, root: ok.root, tld: ok.tld });
@@ -351,16 +354,16 @@
         registerGoodServer(ok);
         perf.successes++;
 
-        // Apply to original image
         img.referrerPolicy = 'no-referrer';
         img.src = url;
         if (img.srcset) img.srcset = url;
+
         img.dataset.batoFixing = 'done';
         img.dataset.batoFixed = 'true';
         delete img.dataset.batoFixStart;
         brokenImageRegistry.delete(img);
 
-        // Broadcast
+        // Broadcast to other broken images
         let broadcastCount = 0;
         brokenImageRegistry.forEach(otherImg => {
             if (otherImg === img || otherImg.dataset.batoFixing === 'done') return;
@@ -370,13 +373,13 @@
             if (!otherImg.dataset.originalSrc) otherImg.dataset.originalSrc = otherImg.src;
             otherImg.dataset.batoFixing = 'broadcasting';
 
-            otherImg.addEventListener('error', function onBroadcastFail() {
+            otherImg.addEventListener('error', function onFail() {
                 otherImg.dataset.batoFixing = 'failed';
                 logWarn(otherImg, 'Broadcast failed → requeue');
                 addToQueue(otherImg, 'high');
             }, { once: true });
 
-            otherImg.addEventListener('load', function onBroadcastSuccess() {
+            otherImg.addEventListener('load', function onSuccess() {
                 if (otherImg.naturalWidth > 0) {
                     otherImg.dataset.batoFixing = 'done';
                     brokenImageRegistry.delete(otherImg);
@@ -389,20 +392,20 @@
             broadcastCount++;
         });
 
-        if (broadcastCount > 0) log(`Broadcasting fix to ${broadcastCount} other images`);
+        if (broadcastCount > 0) log(`Broadcasting fix to ${broadcastCount} images`);
     }
 
     async function fixImage(img) {
         if (img.dataset.batoFixing === 'true' || img.dataset.batoFixing === 'done') return;
 
-        logInfo(img, 'Starting full fix attempt');
+        logInfo(img, 'Starting full fix');
         img.dataset.batoFixing = 'true';
         img.dataset.batoFixStart = Date.now().toString();
 
         const parsed = parseSubdomain(img.src);
         if (!parsed) {
             img.dataset.batoFixing = 'failed';
-            logWarn(img, 'Failed to parse subdomain');
+            logWarn(img, 'Parse failed');
             return;
         }
 
@@ -430,14 +433,14 @@
         const newUrl = `https://${p}${n}.${r}.${t}${parsed.path}`;
         const host = `${p}${n}.${r}.${t}`;
 
-        logInfo(img, `Preemptive fix attempt → ${host}`);
+        logInfo(img, `Preemptive fix → ${host}`);
         img.dataset.originalSrc = img.src;
         img.dataset.batoPreemptive = 'true';
         img.referrerPolicy = 'no-referrer';
 
         const slowTimer = setTimeout(() => {
             if (img.dataset.batoPreemptive === 'true' && !img.complete) {
-                logWarn(img, 'Preemptive too slow → full fix');
+                logWarn(img, 'Preemptive slow → full fix');
                 addToQueue(img, 'high');
             }
         }, 1500);
@@ -472,15 +475,15 @@
     }
 
     function init() {
-        log('%cBatoFixer v7+ (Debug Mode Active)', 'font-size: 16px; color: #ff6b35; font-weight: bold;');
+        log('%cBatoFixer v8 (Fixes ALL bato CDN images - thumbs, avatars, covers, panels)', 'font-size: 16px; color: #ff6b35; font-weight: bold;');
         loadFromStorage();
 
-        // Harvester
+        // Harvest good servers from any successful load
         document.addEventListener('load', e => {
             if (e.target.tagName === 'IMG' && isBatoImage(e.target.src) && e.target.naturalWidth > 0) {
                 const p = parseSubdomain(e.target.src);
                 if (p) {
-                    logInfo(e.target, 'Harvested good server from natural load');
+                    logInfo(e.target, 'Harvested good server');
                     registerGoodServer(p);
                 }
             }
@@ -492,7 +495,7 @@
 
             if (img.complete) {
                 if (img.naturalWidth === 0) {
-                    logWarn(img, 'Broken on initial scan → queue');
+                    logWarn(img, 'Broken on load → queue');
                     addToQueue(img, 'high');
                 } else {
                     const p = parseSubdomain(img.src);
@@ -502,13 +505,13 @@
                 img.addEventListener('error', () => addToQueue(img, 'high'), { once: true });
             }
 
-            // Try preemptive on visible images
+            // Preemptive on any broken-looking image
             if (img.naturalWidth === 0 && knownGoodServers.size > 0) {
                 preemptiveFix(img);
             }
         });
 
-        // Observer
+        // Dynamic content
         new MutationObserver(mutations => {
             mutations.forEach(m => m.addedNodes.forEach(n => {
                 if (n.tagName === 'IMG' && isBatoImage(n.src)) {
@@ -526,19 +529,19 @@
             }));
         }).observe(document.body, { childList: true, subtree: true });
 
-        // Periodic stats & cleanup
+        // Cleanup & stats
         setInterval(() => {
             const now = Date.now();
             document.querySelectorAll('[data-bato-fixing="true"]').forEach(img => {
                 if ((now - parseInt(img.dataset.batoFixStart || 0)) > 20000) {
-                    logWarn(img, 'Fix hung >20s → mark failed');
+                    logWarn(img, 'Fix hung >20s → failed');
                     img.dataset.batoFixing = 'failed';
                     brokenImageRegistry.add(img);
                 }
             });
             if (storageDirty) saveToStorage();
 
-            if (CONFIG.DEBUG && (perf.probesMade % 50 === 0)) {
+            if (CONFIG.DEBUG && perf.probesMade % 50 === 0 && perf.probesMade > 0) {
                 log('Stats:', {
                     successes: perf.successes,
                     failures: perf.failures,
