@@ -1,14 +1,14 @@
 (() => {
     // --- Configuration ---
     const CONFIG = {
-        PROBE_TIMEOUT: 2500,        
-        MAX_ATTEMPTS: 30,           
-        MAX_SERVER_CAP: 20,         
-        MAX_CONCURRENT_PROBES: 12,  
+        PROBE_TIMEOUT: 2500,
+        MAX_ATTEMPTS: 30,
+        MAX_SERVER_CAP: 20,
+        MAX_CONCURRENT_PROBES: 12,
         CACHE_LIMIT: 2000,
         FAILED_CACHE_LIMIT: 5000,
-        DEBUG: false,
-        STORAGE_KEY_CACHE: 'bato_fixer_cache_v7', 
+        DEBUG: false,  // ←←← SET TO true FOR DETAILED LOGS ←←←
+        STORAGE_KEY_CACHE: 'bato_fixer_cache_v7',
         STORAGE_KEY_CONTEXT: 'bato_fixer_context_v7'
     };
 
@@ -19,7 +19,7 @@
         'mbeaj.org', 'mbzcp.org', 'mbuul.org', 'mbtmv.org', 'mbimg.org', 'mbopg.org',
         'mbfpu.org'
     ];
-    
+
     const IGNORE_PATTERNS = [
         '/rec?', 'pubadx', 'adform', 'criteo', 'doubleclick',
         'googlesyndication', 'monetix', '/ads/', 'googleapis.com'
@@ -31,55 +31,60 @@
     // --- State Management ---
     let serverCache = new Map();
     let failedCache = new Set();
-    let knownGoodServers = new Set(); 
-    const brokenImageRegistry = new Set(); 
+    let knownGoodServers = new Set();
+    const brokenImageRegistry = new Set();
 
-    // --- High-Speed Concurrency Control ---
+    // --- Concurrency & Queue ---
     class Semaphore {
-        constructor(max) {
-            this.max = max;
-            this.counter = 0;
-            this.queue = [];
-        }
+        constructor(max) { this.max = max; this.counter = 0; this.queue = []; }
         async acquire() {
-            if (this.counter < this.max) {
-                this.counter++;
-                return Promise.resolve();
-            }
+            if (this.counter < this.max) { this.counter++; return; }
             return new Promise(resolve => this.queue.push(resolve));
         }
         release() {
             this.counter--;
-            if (this.queue.length > 0) {
-                this.counter++;
-                const resolve = this.queue.shift();
-                resolve();
-            }
+            if (this.queue.length > 0) { this.counter++; this.queue.shift()(); }
         }
     }
     const globalLimiter = new Semaphore(CONFIG.MAX_CONCURRENT_PROBES);
 
-    const processingQueue = {
-        high: [],
-        low: [],
-        isProcessing: false
-    };
-
+    const processingQueue = { high: [], low: [], isProcessing: false };
     let storageDirty = false;
     let storageSaveTimeout;
 
-    const perf = { successes: 0, failures: 0, probesMade: 0 };
+    const perf = { successes: 0, failures: 0, probesMade: 0, preemptiveSuccess: 0, preemptiveFail: 0, broadcastSuccess: 0 };
 
-    function log(...args) { if (CONFIG.DEBUG) console.log('[BatoFixer]', ...args); }
+    // --- Enhanced Logging ---
+    function log(...args) {
+        if (CONFIG.DEBUG) console.log('%c[BatoFixer]', 'color: #ff6b35; font-weight: bold;', ...args);
+    }
+    function logInfo(img, msg) {
+        if (!CONFIG.DEBUG) return;
+        const shortSrc = img.src?.split('/').slice(-3).join('/') || 'unknown';
+        console.log(`%c[Info] ${msg}`, 'color: #4caf50;', shortSrc, img);
+    }
+    function logWarn(img, msg) {
+        if (!CONFIG.DEBUG) return;
+        const shortSrc = img.src?.split('/').slice(-3).join('/') || 'unknown';
+        console.warn(`[Warn] ${msg}`, shortSrc, img);
+    }
 
     // --- Storage ---
     function loadFromStorage() {
         try {
             const c = localStorage.getItem(CONFIG.STORAGE_KEY_CACHE);
-            if (c) serverCache = new Map(JSON.parse(c));
+            if (c) {
+                serverCache = new Map(JSON.parse(c));
+                log('Loaded serverCache:', serverCache.size, 'entries');
+            }
             const k = localStorage.getItem(CONFIG.STORAGE_KEY_CONTEXT);
-            if (k) knownGoodServers = new Set(JSON.parse(k));
-        } catch (e) {}
+            if (k) {
+                knownGoodServers = new Set(JSON.parse(k));
+                log('Loaded knownGoodServers:', knownGoodServers.size, 'servers');
+            }
+        } catch (e) {
+            log('Storage load error:', e);
+        }
     }
 
     function saveToStorage() {
@@ -96,8 +101,11 @@
             }
             localStorage.setItem(CONFIG.STORAGE_KEY_CACHE, JSON.stringify([...serverCache]));
             localStorage.setItem(CONFIG.STORAGE_KEY_CONTEXT, JSON.stringify([...knownGoodServers]));
+            log('Storage saved:', { serverCache: serverCache.size, knownGood: knownGoodServers.size });
             storageDirty = false;
-        } catch (e) {}
+        } catch (e) {
+            log('Storage save error:', e);
+        }
     }
 
     function markStorageDirty() {
@@ -109,16 +117,26 @@
 
     // --- Helpers ---
     function isBatoImage(src) { return src && BATO_PATTERN.test(src); }
+
     function shouldIgnore(src) {
         if (!src || !isBatoImage(src)) return true;
         return IGNORE_PATTERNS.some(p => src.includes(p));
     }
+
     function parseSubdomain(src) {
         const m = src.match(SUBDOMAIN_RE);
         if (!m) return null;
-        return { prefix: m[1].toLowerCase(), numberStr: m[2], root: m[3].toLowerCase(), tld: m[4].toLowerCase(), path: m[5] };
+        return {
+            prefix: m[1].toLowerCase(),
+            numberStr: m[2],
+            root: m[3].toLowerCase(),
+            tld: m[4].toLowerCase(),
+            path: m[5]
+        };
     }
+
     function getServerSignature(p, n, r, t) { return `${p}|${n}|${r}|${t}`; }
+
     function getCacheKeyFromSrc(src) {
         const parsed = parseSubdomain(src);
         if (!parsed) return null;
@@ -132,74 +150,112 @@
         if (typeof input === 'string') [prefix, numberStr, root, tld] = input.split('|');
         else if (input && 'prefix' in input) ({ prefix, numberStr, root, tld } = input);
         if (!prefix) return;
+
         const sig = getServerSignature(prefix, numberStr, root, tld);
-        if (knownGoodServers.has(sig)) knownGoodServers.delete(sig); // Touch (LRU)
+        const host = `${prefix}${numberStr}.${root}.${tld}`;
+        if (knownGoodServers.has(sig)) knownGoodServers.delete(sig);
         knownGoodServers.add(sig);
+        log('Registered good server:', host, `(total: ${knownGoodServers.size})`);
         markStorageDirty();
     }
 
     // --- Queue System ---
     function addToQueue(img, priority = 'low') {
-        if (shouldIgnore(img.src) || img.dataset.batoQueued) return;
+        if (shouldIgnore(img.src)) {
+            logInfo(img, 'Ignored (not bato image or ad)');
+            return;
+        }
+        if (img.dataset.batoQueued) {
+            logInfo(img, 'Already queued, skipping');
+            return;
+        }
+
         brokenImageRegistry.add(img);
         if (priority === 'auto') {
             const rect = img.getBoundingClientRect();
             priority = (rect.bottom > -100 && rect.top < window.innerHeight + 500) ? 'high' : 'low';
         }
+
         img.dataset.batoQueued = priority;
         processingQueue[priority].push(img);
+        logInfo(img, `Queued as ${priority} (queue: high=${processingQueue.high.length}, low=${processingQueue.low.length})`);
         processQueue();
     }
 
     async function processQueue() {
         if (processingQueue.isProcessing) return;
         processingQueue.isProcessing = true;
+        log('Starting queue processing...');
+
         while (processingQueue.high.length > 0 || processingQueue.low.length > 0) {
             const batch = [];
             const fill = (q) => {
-                while (batch.length < 5 && q.length > 0) { 
+                while (batch.length < 5 && q.length > 0) {
                     const img = q.shift();
-                    if (img.isConnected) { delete img.dataset.batoQueued; batch.push(img); }
-                    else brokenImageRegistry.delete(img);
+                    if (img.isConnected) {
+                        delete img.dataset.batoQueued;
+                        batch.push(img);
+                    } else {
+                        brokenImageRegistry.delete(img);
+                    }
                 }
             };
             fill(processingQueue.high);
             fill(processingQueue.low);
+
             if (batch.length === 0) break;
-            
-            // Start fixes in parallel
-            batch.forEach(img => fixImage(img)); 
-            await new Promise(r => setTimeout(r, 50)); 
+
+            log(`Processing batch of ${batch.length} images`);
+            batch.forEach(img => fixImage(img));
+            await new Promise(r => setTimeout(r, 50));
         }
+
         processingQueue.isProcessing = false;
+        log('Queue processing finished');
     }
 
-    // --- Fast Probing Logic ---
-
+    // --- Probing Logic ---
     async function probeSingle(url) {
         const hostKey = url.split('/').slice(0, 3).join('/');
-        if (failedCache.has(hostKey)) return Promise.reject('cached');
+        if (failedCache.has(hostKey)) {
+            log('Probe skipped (negative cache):', hostKey);
+            return Promise.reject('cached');
+        }
 
         await globalLimiter.acquire();
         perf.probesMade++;
+        log(`Probing: ${hostKey}`);
 
         try {
             return await new Promise((resolve, reject) => {
                 const img = new Image();
                 img.referrerPolicy = 'no-referrer';
                 let timer = setTimeout(() => {
-                    img.src = ''; failedCache.add(hostKey); reject('timeout');
+                    img.src = '';
+                    failedCache.add(hostKey);
+                    log('Probe timeout:', hostKey);
+                    reject('timeout');
                 }, CONFIG.PROBE_TIMEOUT);
 
                 img.onload = () => {
                     clearTimeout(timer);
-                    if (img.width > 1) resolve(url);
-                    else { failedCache.add(hostKey); reject('empty'); }
+                    if (img.width > 1) {
+                        log('%cProbe success!', 'color: #4caf50; font-weight: bold;', hostKey);
+                        resolve(url);
+                    } else {
+                        failedCache.add(hostKey);
+                        log('Probe empty image (1x1?):', hostKey);
+                        reject('empty');
+                    }
                 };
+
                 img.onerror = () => {
                     clearTimeout(timer);
-                    failedCache.add(hostKey); reject('error');
+                    failedCache.add(hostKey);
+                    log('Probe error:', hostKey);
+                    reject('error');
                 };
+
                 img.src = url;
             });
         } finally {
@@ -208,79 +264,85 @@
     }
 
     function findFastestCandidate(candidates) {
+        log(`Finding fastest among ${candidates.length} candidates`);
+        if (candidates.length === 0) return Promise.reject('No candidates');
+
         return new Promise((resolve, reject) => {
-            let active = 0;
-            let index = 0;
-            let resolved = false;
-            let failures = 0;
+            let active = 0, index = 0, resolved = false, failures = 0;
 
             const spawn = () => {
-                if (resolved) return;
-                if (index >= candidates.length) {
+                if (resolved || index >= candidates.length) {
                     if (active === 0 && !resolved) reject('All failed');
                     return;
                 }
-
                 const url = candidates[index++];
-                if (failedCache.has(url.split('/').slice(0,3).join('/'))) {
-                    failures++;
-                    spawn(); 
-                    return;
-                }
+                const hostKey = url.split('/').slice(0, 3).join('/');
+                if (failedCache.has(hostKey)) { failures++; spawn(); return; }
 
                 active++;
                 probeSingle(url).then(validUrl => {
                     if (!resolved) {
                         resolved = true;
+                        log('%cWinner found!', 'color: #ffeb3b; background: #333; font-weight: bold;', hostKey);
                         resolve(validUrl);
                     }
                 }).catch(() => {
                     active--;
                     failures++;
-                    spawn(); 
+                    spawn();
                 });
             };
 
-            const waveSize = Math.min(6, candidates.length); 
+            const waveSize = Math.min(6, candidates.length);
             for (let i = 0; i < waveSize; i++) spawn();
         });
     }
 
     function generateCandidates(parsed) {
         const cand = [];
-        const add = (p, n, r, t, prio) => cand.push({ url: `https://${p}${String(n).padStart(2, '0')}.${r}.${t}${parsed.path}`, p: prio });
+        const add = (p, n, r, t, prio) => {
+            const url = `https://${p}${String(n).padStart(2, '0')}.${r}.${t}${parsed.path}`;
+            cand.push({ url, p: prio, host: `${p}${String(n).padStart(2, '0')}.${r}.${t}` });
+        };
 
-        // 1. KNOWN SERVERS (Highest Priority: -1.0 to -0.8)
+        // 1. Known good
         Array.from(knownGoodServers).reverse().forEach((sig, i) => {
             const [p, n, r, t] = sig.split('|');
-            if (p !== parsed.prefix || n !== parsed.numberStr) add(p, n, r, t, -1 + (i*0.01));
+            if (p !== parsed.prefix || n !== parsed.numberStr) add(p, n, r, t, -1 + (i * 0.01));
         });
 
-        // 2. CACHE (Priority 0)
+        // 2. Cache
         const pathKey = getCacheKeyFromSrc(`https://${parsed.prefix}${parsed.numberStr}.${parsed.root}.${parsed.tld}${parsed.path}`);
         if (pathKey && serverCache.has(pathKey)) {
             const c = serverCache.get(pathKey);
             add(c.prefix, c.number, c.root, c.tld, 0);
+            log('Cache hit:', pathKey, '→', `${c.prefix}${c.number}.${c.root}.${c.tld}`);
         }
 
-        // 3. BRUTE FORCE HEURISTICS (Priority 1+)
+        // 3. Heuristics
         if (parsed.prefix === 'k') ['n','x','t'].forEach(l => add(l, parsed.numberStr, parsed.root, parsed.tld, 1));
         ['03','01','02','04','05','00'].forEach((n,i) => { if(n !== parsed.numberStr) add(parsed.prefix, n, parsed.root, parsed.tld, 2+i*0.1); });
         FALLBACK_PREFIXES.filter(l => l !== parsed.prefix && l !== 'k').forEach((l,i) => add(l, parsed.numberStr, parsed.root, parsed.tld, 3+i*0.1));
         FALLBACK_ROOTS.forEach(root => { const [r,t] = root.split('.'); if(r !== parsed.root) add(parsed.prefix, parsed.numberStr, r, t, 4); });
 
         const unique = new Set();
-        return cand.sort((a,b) => a.p - b.p)
-                   .filter(c => !unique.has(c.url) && unique.add(c.url))
-                   .map(c => c.url)
-                   .slice(0, CONFIG.MAX_ATTEMPTS); 
+        const final = cand.sort((a,b) => a.p - b.p)
+            .filter(c => !unique.has(c.url) && unique.add(c.url))
+            .map(c => c.url)
+            .slice(0, CONFIG.MAX_ATTEMPTS);
+
+        log(`Generated ${final.length} candidates (top 5 hosts):`, cand.slice(0,5).map(c => c.host));
+        return final;
     }
 
     function applyFix(img, url) {
         const ok = parseSubdomain(url);
         if (!ok) return;
 
-        // Save context
+        const host = `${ok.prefix}${ok.numberStr}.${ok.root}.${ok.tld}`;
+        log('%cFixed image!', 'color: #4caf50; font-weight: bold;', host);
+
+        // Cache & register
         const pathKey = getCacheKeyFromSrc(img.dataset.originalSrc || img.src);
         if (pathKey) {
             serverCache.set(pathKey, { prefix: ok.prefix, number: ok.numberStr, root: ok.root, tld: ok.tld });
@@ -289,56 +351,60 @@
         registerGoodServer(ok);
         perf.successes++;
 
-        // Apply
+        // Apply to original image
         img.referrerPolicy = 'no-referrer';
         img.src = url;
         if (img.srcset) img.srcset = url;
-        
         img.dataset.batoFixing = 'done';
         img.dataset.batoFixed = 'true';
         delete img.dataset.batoFixStart;
         brokenImageRegistry.delete(img);
 
         // Broadcast
-        const sig = getServerSignature(ok.prefix, ok.numberStr, ok.root, ok.tld);
-        const host = `${ok.prefix}${ok.numberStr}.${ok.root}.${ok.tld}`;
-        
-        // Massive Broadcast with Fallback
+        let broadcastCount = 0;
         brokenImageRegistry.forEach(otherImg => {
             if (otherImg === img || otherImg.dataset.batoFixing === 'done') return;
             const p = parseSubdomain(otherImg.src);
             if (!p || (p.prefix === ok.prefix && p.numberStr === ok.numberStr)) return;
-            
+
             if (!otherImg.dataset.originalSrc) otherImg.dataset.originalSrc = otherImg.src;
-            
-            // [FIXED] Do NOT mark as done immediately. 
-            // Mark as 'broadcasting' and let the load event confirm it.
             otherImg.dataset.batoFixing = 'broadcasting';
-            
+
             otherImg.addEventListener('error', function onBroadcastFail() {
-                 otherImg.dataset.batoFixing = 'failed';
-                 // Re-queue the image for a full individual scan
-                 addToQueue(otherImg, 'high');
+                otherImg.dataset.batoFixing = 'failed';
+                logWarn(otherImg, 'Broadcast failed → requeue');
+                addToQueue(otherImg, 'high');
             }, { once: true });
 
             otherImg.addEventListener('load', function onBroadcastSuccess() {
-                 if (otherImg.naturalWidth > 0) {
-                     otherImg.dataset.batoFixing = 'done';
-                     brokenImageRegistry.delete(otherImg);
-                 }
+                if (otherImg.naturalWidth > 0) {
+                    otherImg.dataset.batoFixing = 'done';
+                    brokenImageRegistry.delete(otherImg);
+                    perf.broadcastSuccess++;
+                    logInfo(otherImg, 'Broadcast success');
+                }
             }, { once: true });
 
             otherImg.src = `https://${host}${p.path}`;
+            broadcastCount++;
         });
+
+        if (broadcastCount > 0) log(`Broadcasting fix to ${broadcastCount} other images`);
     }
 
     async function fixImage(img) {
         if (img.dataset.batoFixing === 'true' || img.dataset.batoFixing === 'done') return;
+
+        logInfo(img, 'Starting full fix attempt');
         img.dataset.batoFixing = 'true';
         img.dataset.batoFixStart = Date.now().toString();
 
         const parsed = parseSubdomain(img.src);
-        if (!parsed) { img.dataset.batoFixing = 'failed'; return; }
+        if (!parsed) {
+            img.dataset.batoFixing = 'failed';
+            logWarn(img, 'Failed to parse subdomain');
+            return;
+        }
 
         try {
             const candidates = generateCandidates(parsed);
@@ -347,7 +413,7 @@
         } catch (e) {
             img.dataset.batoFixing = 'failed';
             perf.failures++;
-            // Note: It stays in brokenImageRegistry, so a future broadcast might save it.
+            logWarn(img, 'All probes failed');
         }
     }
 
@@ -357,27 +423,33 @@
         if (!parsed) return false;
 
         const servers = Array.from(knownGoodServers);
-        const sig = servers[servers.length - 1]; 
+        const sig = servers[servers.length - 1];
         const [p, n, r, t] = sig.split('|');
         if (p === parsed.prefix && n === parsed.numberStr) return false;
 
         const newUrl = `https://${p}${n}.${r}.${t}${parsed.path}`;
+        const host = `${p}${n}.${r}.${t}`;
+
+        logInfo(img, `Preemptive fix attempt → ${host}`);
         img.dataset.originalSrc = img.src;
         img.dataset.batoPreemptive = 'true';
         img.referrerPolicy = 'no-referrer';
 
         const slowTimer = setTimeout(() => {
-             if (img.dataset.batoPreemptive === 'true' && !img.complete) {
-                 addToQueue(img, 'high'); 
-             }
+            if (img.dataset.batoPreemptive === 'true' && !img.complete) {
+                logWarn(img, 'Preemptive too slow → full fix');
+                addToQueue(img, 'high');
+            }
         }, 1500);
 
-        const cleanup = () => { clearTimeout(slowTimer); };
+        const cleanup = () => clearTimeout(slowTimer);
 
         img.addEventListener('error', () => {
             cleanup();
             img.src = img.dataset.originalSrc;
             img.dataset.batoPreemptive = 'failed';
+            perf.preemptiveFail++;
+            logWarn(img, 'Preemptive failed');
             addToQueue(img, 'high');
         }, { once: true });
 
@@ -386,9 +458,12 @@
             if (img.naturalWidth > 0) {
                 img.dataset.batoPreemptive = '';
                 img.dataset.batoFixing = 'done';
+                perf.preemptiveSuccess++;
                 perf.successes++;
+                logInfo(img, 'Preemptive success!');
+                registerGoodServer({ prefix: p, numberStr: n, root: r, tld: t });
             } else {
-                img.dispatchEvent(new Event('error')); 
+                img.dispatchEvent(new Event('error'));
             }
         }, { once: true });
 
@@ -397,26 +472,39 @@
     }
 
     function init() {
-        log('BatoFixer v7 (Robust)');
+        log('%cBatoFixer v7+ (Debug Mode Active)', 'font-size: 16px; color: #ff6b35; font-weight: bold;');
         loadFromStorage();
 
         // Harvester
         document.addEventListener('load', e => {
             if (e.target.tagName === 'IMG' && isBatoImage(e.target.src) && e.target.naturalWidth > 0) {
                 const p = parseSubdomain(e.target.src);
-                if (p) registerGoodServer(p);
+                if (p) {
+                    logInfo(e.target, 'Harvested good server from natural load');
+                    registerGoodServer(p);
+                }
             }
         }, true);
 
-        // Initial Scan
+        // Initial scan
         document.querySelectorAll('img').forEach(img => {
-            if (isBatoImage(img.src)) {
-                if (img.complete) {
-                    if (img.naturalWidth === 0) addToQueue(img, 'high');
-                    else registerGoodServer(parseSubdomain(img.src));
+            if (!isBatoImage(img.src)) return;
+
+            if (img.complete) {
+                if (img.naturalWidth === 0) {
+                    logWarn(img, 'Broken on initial scan → queue');
+                    addToQueue(img, 'high');
                 } else {
-                    img.addEventListener('error', () => addToQueue(img, 'high'), { once: true });
+                    const p = parseSubdomain(img.src);
+                    if (p) registerGoodServer(p);
                 }
+            } else {
+                img.addEventListener('error', () => addToQueue(img, 'high'), { once: true });
+            }
+
+            // Try preemptive on visible images
+            if (img.naturalWidth === 0 && knownGoodServers.size > 0) {
+                preemptiveFix(img);
             }
         });
 
@@ -425,22 +513,42 @@
             mutations.forEach(m => m.addedNodes.forEach(n => {
                 if (n.tagName === 'IMG' && isBatoImage(n.src)) {
                     if (!n.complete) n.addEventListener('error', () => addToQueue(n, 'high'), { once: true });
+                    if (knownGoodServers.size > 0) preemptiveFix(n);
                 }
-                if (n.querySelectorAll) n.querySelectorAll('img').forEach(i => {
-                    if (isBatoImage(i.src) && !i.complete) i.addEventListener('error', () => addToQueue(i, 'high'), { once: true });
-                });
+                if (n.querySelectorAll) {
+                    n.querySelectorAll('img').forEach(i => {
+                        if (isBatoImage(i.src) && !i.complete) {
+                            i.addEventListener('error', () => addToQueue(i, 'high'), { once: true });
+                            if (knownGoodServers.size > 0) preemptiveFix(i);
+                        }
+                    });
+                }
             }));
         }).observe(document.body, { childList: true, subtree: true });
 
+        // Periodic stats & cleanup
         setInterval(() => {
             const now = Date.now();
             document.querySelectorAll('[data-bato-fixing="true"]').forEach(img => {
-                if ((now - parseInt(img.dataset.batoFixStart||0)) > 20000) {
+                if ((now - parseInt(img.dataset.batoFixStart || 0)) > 20000) {
+                    logWarn(img, 'Fix hung >20s → mark failed');
                     img.dataset.batoFixing = 'failed';
                     brokenImageRegistry.add(img);
                 }
             });
             if (storageDirty) saveToStorage();
+
+            if (CONFIG.DEBUG && (perf.probesMade % 50 === 0)) {
+                log('Stats:', {
+                    successes: perf.successes,
+                    failures: perf.failures,
+                    probes: perf.probesMade,
+                    preemptive: `${perf.preemptiveSuccess}/${perf.preemptiveSuccess + perf.preemptiveFail}`,
+                    broadcast: perf.broadcastSuccess,
+                    registry: brokenImageRegistry.size,
+                    goodServers: knownGoodServers.size
+                });
+            }
         }, 5000);
     }
 
