@@ -4,7 +4,7 @@
         PROBE_TIMEOUT: 2500,
         MAX_ATTEMPTS: 30,
         MAX_SERVER_CAP: 20,
-        MAX_CONCURRENT_PROBES: 12,
+        MAX_CONCURRENT_PROBES: 4,
         CACHE_LIMIT: 2000,
         FAILED_CACHE_LIMIT: 5000,
         MAX_RETRIES_PER_IMAGE: 1,
@@ -619,3 +619,4 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
     else init();
 })();
+
