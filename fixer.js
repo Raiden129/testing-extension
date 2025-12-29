@@ -238,89 +238,140 @@
         log('queue:done');
     }
 
-    // --- Probing Logic ---
-    async function probeSingle(url) {
+    
+    // Returns an object: { promise, cancel() }
+    function probeSingle(url) {
         const hostKey = url.split('/').slice(0, 3).join('/');
-        if (failedCache.has(hostKey)) {
-            log('Probe skipped (negative cache):', hostKey);
-            return Promise.reject('cached');
-        }
+        let cancelFn = () => {};
 
-        await globalLimiter.acquire();
-        perf.probesMade++;
-        log('probe:start', hostKey);
+        const promise = (async () => {
+            if (failedCache.has(hostKey)) {
+                return Promise.reject('cached');
+            }
 
-        try {
-            return await new Promise((resolve, reject) => {
+            await globalLimiter.acquire();
+            perf.probesMade++;
+            
+            return new Promise((resolve, reject) => {
                 const img = new Image();
                 img.referrerPolicy = 'no-referrer';
-                let timer = setTimeout(() => {
-                    img.src = '';
-                    failedCache.add(hostKey);
-                    if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
-                    log('probe:timeout', hostKey);
-                    reject('timeout');
+                
+                let isFinished = false;
+
+                const cleanup = () => {
+                    isFinished = true;
+                    // crucial: breaking the src connection frees bandwidth
+                    img.onload = null;
+                    img.onerror = null;
+                    globalLimiter.release(); 
+                };
+
+                // This function allows the parent to kill this probe
+                cancelFn = () => {
+                    if (!isFinished) {
+                        img.src = ''; 
+                        cleanup();
+                        reject('cancelled');
+                    }
+                };
+
+                const timer = setTimeout(() => {
+                    if (!isFinished) {
+                        failedCache.add(hostKey);
+                        if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
+                        cleanup();
+                        img.src = ''; 
+                        reject('timeout');
+                    }
                 }, CONFIG.PROBE_TIMEOUT);
 
                 img.onload = () => {
+                    if (isFinished) return;
                     clearTimeout(timer);
                     if (img.width > 1) {
-                        log('probe:success', hostKey);
+                        cleanup();
                         resolve(url);
                     } else {
                         failedCache.add(hostKey);
-                        if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
-                        log('probe:empty', hostKey);
+                        cleanup();
                         reject('empty');
                     }
                 };
 
                 img.onerror = () => {
+                    if (isFinished) return;
                     clearTimeout(timer);
                     failedCache.add(hostKey);
-                    if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
-                    log('probe:error', hostKey);
+                    cleanup();
                     reject('error');
                 };
 
                 img.src = url;
             });
-        } finally {
-            globalLimiter.release();
-        }
+        })();
+
+        return { promise, cancel: () => cancelFn() };
     }
 
     function findFastestCandidate(candidates) {
-        log('candidate:race', { count: candidates.length });
+        // REDUCED: Was 6. Lowering wave size helps slow connections.
+        const WAVE_SIZE = 3; 
+        
         if (candidates.length === 0) return Promise.reject('No candidates');
 
         return new Promise((resolve, reject) => {
-            let active = 0, index = 0, resolved = false;
+            let active = 0;
+            let index = 0;
+            let resolved = false;
+            const runningProbes = new Set(); // Track active probes to kill them later
+
+            const killLosers = () => {
+                runningProbes.forEach(probe => probe.cancel());
+                runningProbes.clear();
+            };
 
             const spawn = () => {
-                if (resolved || index >= candidates.length) {
+                if (resolved) return;
+
+                if (index >= candidates.length) {
                     if (active === 0 && !resolved) reject('All failed');
                     return;
                 }
+
                 const url = candidates[index++];
                 const hostKey = url.split('/').slice(0, 3).join('/');
-                if (failedCache.has(hostKey)) { spawn(); return; }
+                
+                // Skip cached failures immediately
+                if (failedCache.has(hostKey)) {
+                    spawn();
+                    return;
+                }
 
                 active++;
-                probeSingle(url).then(validUrl => {
+                
+                // probeSingle now returns { promise, cancel }
+                const probe = probeSingle(url);
+                runningProbes.add(probe);
+
+                probe.promise.then(validUrl => {
                     if (!resolved) {
                         resolved = true;
-                        log('candidate:winner', hostKey);
+                        killLosers(); // <--- This fixes the "top to bottom" lag
                         resolve(validUrl);
                     }
-                }).catch(() => {
+                }).catch((reason) => {
+                    runningProbes.delete(probe);
                     active--;
-                    spawn();
+                    if (reason !== 'cancelled') {
+                        spawn();
+                    }
                 });
             };
 
-            const waveSize = Math.min(6, candidates.length);
-            for (let i = 0; i < waveSize; i++) spawn();
+            // Start the initial wave
+            for (let i = 0; i < Math.min(WAVE_SIZE, candidates.length); i++) {
+                spawn();
+            }
         });
     }
 
@@ -619,4 +670,3 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
     else init();
 })();
-
