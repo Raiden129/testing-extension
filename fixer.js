@@ -3,11 +3,11 @@
         PROBE_TIMEOUT: 2500,
         MAX_ATTEMPTS: 30,
         MAX_SERVER_CAP: 20,
-        MAX_CONCURRENT_PROBES: 4,
+        MAX_CONCURRENT_PROBES: 6,
         CACHE_LIMIT: 2000,
         FAILED_CACHE_LIMIT: 5000,
         MAX_RETRIES_PER_IMAGE: 1,
-        DEBUG: false,
+        DEBUG: true,
         STORAGE_KEY_CACHE: 'bato_fixer_cache_v8',
         STORAGE_KEY_CONTEXT: 'bato_fixer_context_v8',
         STORAGE_KEY_STATS: 'bato_fixer_hoststats_v1',
@@ -40,6 +40,19 @@
     `.trim().split(/\s+/);
 
     const STRONG_FALLBACK_PREFIXES = ['n', 'd', 'b'];
+
+    const PREPARED_STATIC_SERVERS = MASTER_STATIC_SERVERS
+        .map(host => {
+            const m = host.match(/^([a-z]+)(\d+)\.([a-z0-9\-]+)\.([a-z]{2,})$/i);
+            if (!m) return null;
+            return {
+                prefix: m[1].toLowerCase(),
+                numberStr: m[2],
+                root: m[3].toLowerCase(),
+                tld: m[4].toLowerCase()
+            };
+        })
+        .filter(Boolean);
 
     const IGNORE_PATTERNS = [
         '/rec?', 'pubadx', 'adform', 'criteo', 'doubleclick',
@@ -401,7 +414,7 @@
         while (processingQueue.high.length > 0 || processingQueue.low.length > 0) {
             const batch = [];
             const fill = (q) => {
-                while (batch.length < 5 && q.length > 0) {
+                while (batch.length < 8 && q.length > 0) {
                     const img = q.shift();
                     if (img.isConnected) {
                         delete img.dataset.batoQueued;
@@ -418,7 +431,7 @@
 
             log('queue:batch', { size: batch.length });
             batch.forEach(img => fixImage(img));
-            await new Promise(r => setTimeout(r, 50));
+            await new Promise(r => setTimeout(r, 10));
         }
 
         processingQueue.isProcessing = false;
@@ -604,14 +617,8 @@
             cand.push({ url, p: prio, host: `${p}${String(n).padStart(2, '0')}.${r}.${t}` });
         };
 
-        MASTER_STATIC_SERVERS.forEach((host, idx) => {
-            const m = host.match(/^([a-z]+)(\d+)\.([a-z0-9\-]+)\.([a-z]{2,})$/i);
-            if (!m) return;
-            const p = m[1].toLowerCase();
-            const n = m[2];
-            const r = m[3].toLowerCase();
-            const t = m[4].toLowerCase();
-            add(p, n, r, t, -2 + idx * 0.01);
+        PREPARED_STATIC_SERVERS.forEach((srv, idx) => {
+            add(srv.prefix, srv.numberStr, srv.root, srv.tld, -2 + idx * 0.01);
         });
 
         Array.from(knownGoodServers).reverse().forEach((sig, i) => {
