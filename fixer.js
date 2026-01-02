@@ -1,5 +1,4 @@
 (() => {
-    // --- Configuration ---
     const CONFIG = {
         PROBE_TIMEOUT: 2500,
         MAX_ATTEMPTS: 30,
@@ -8,33 +7,56 @@
         CACHE_LIMIT: 2000,
         FAILED_CACHE_LIMIT: 5000,
         MAX_RETRIES_PER_IMAGE: 1,
-        DEBUG: false,  // Set to true for detailed console logs
+        DEBUG: false,
         STORAGE_KEY_CACHE: 'bato_fixer_cache_v8',
-        STORAGE_KEY_CONTEXT: 'bato_fixer_context_v8'
+        STORAGE_KEY_CONTEXT: 'bato_fixer_context_v8',
+        STORAGE_KEY_STATS: 'bato_fixer_hoststats_v1',
+        HOST_STATS_LIMIT: 400,
+        UCB_K: 0.6,
+        LATENCY_BASE_MS: 300,
+        STATS_HALF_LIFE_MS: 60 * 60 * 1000
     };
+    const FALLBACK_PREFIXES = ['n', 'x', 't', 's', 'w', 'm', 'c', 'u', 'k', 'd', 'b'];
 
-    const FALLBACK_PREFIXES = ['n', 'x', 't', 's', 'w', 'm', 'c', 'u', 'k'];
     const FALLBACK_ROOTS = [
+        'mpfip.org', 'mpizz.org', 'mpmok.org', 'mpqom.org', 'mpqsc.org', 'mprnm.org',
+        'mpubn.org', 'mpujj.org', 'mpvim.org', 'mpypl.org',
         'mbdny.org', 'mbrtz.org', 'bato.to', 'mbwbm.org', 'mbznp.org', 'mbqgu.org',
         'mbtba.org', 'mbhiz.org', 'mbwnp.org', 'mbxma.org', 'mbwww.org', 'mbmyj.org',
         'mbeaj.org', 'mbzcp.org', 'mbuul.org', 'mbtmv.org', 'mbimg.org', 'mbopg.org',
         'mbfpu.org'
     ];
 
+    const MASTER_STATIC_SERVERS = `
+        n06.mbtmv.org n03.mbuul.org n07.mbdny.org n00.mbfpu.org n11.mbznp.org n06.mbopg.org n08.mbwbm.org n12.mbmyj.org n03.mbqgu.org n09.mbtba.org
+        n05.mbxma.org n11.mbfpu.org n04.mbwbm.org n07.mbwnp.org n12.mbimg.org n12.mbqgu.org n14.mbwbm.org n14.mbznp.org n14.mbopg.org n11.mbwbm.org
+        n11.mbdny.org n02.mbopg.org b01.mbfpu.org n02.mbmyj.org n11.mbwww.org n09.mbopg.org n00.mbrtz.org n08.mbfpu.org n05.mbwww.org d01.mbmyj.org
+        n09.mbhiz.org n07.mbqgu.org n05.mbimg.org n08.mbimg.org n08.mbhiz.org n07.mbwww.org n05.mbmyj.org n03.mbimg.org d01.mbznp.org d01.mbopg.org
+        n02.mbuul.org n12.mbfpu.org n01.mbdny.org n10.mbrtz.org n01.mbrtz.org b01.mbwbm.org n15.mbeaj.org n15.mbwww.org n00.mbwww.org n09.mbimg.org
+        b01.mbtmv.org n10.mbfpu.org n10.mbhiz.org s01.mpmok.org n06.mbhiz.org n09.mbdny.org n11.mbopg.org n04.mbzcp.org n15.mbtmv.org n03.mbfpu.org
+        n03.mbzcp.org d01.mbwbm.org n05.mbfpu.org s06.mpmok.org n03.mbopg.org n10.mbopg.org n10.mbeaj.org n12.mbwbm.org n04.mbuul.org n01.mbtba.org
+        n02.mbwww.org n15.mbuul.org n09.mbwww.org n07.mbxma.org n10.mbwnp.org n07.mbopg.org n15.mbwbm.org n02.mbwnp.org b01.mbwww.org n15.mbzcp.org
+        b01.mbmyj.org n12.mbeaj.org n10.mbimg.org n06.mbzcp.org n09.mbeaj.org b01.mbzcp.org n07.mbrtz.org
+    `.trim().split(/\s+/);
+
+    const STRONG_FALLBACK_PREFIXES = ['n', 'd', 'b'];
+
     const IGNORE_PATTERNS = [
         '/rec?', 'pubadx', 'adform', 'criteo', 'doubleclick',
         'googlesyndication', 'monetix', '/ads/', 'googleapis.com'
     ];
 
-    // Broad pattern: matches any image on letter+number.domain.tld (any path)
     const SUBDOMAIN_RE = /^https?:\/\/([a-z]+)(\d+)\.([a-z0-9\-]+)\.([a-z]{2,})(\/.*)$/i;
     const BATO_PATTERN = /^https?:\/\/[a-z]+\d+\.[a-z0-9\-]+\.[a-z]{2,}\/?/i;
 
-    // --- State Management ---
     let serverCache = new Map();
     let failedCache = new Set();
     let knownGoodServers = new Set();
+    let hostStats = new Map();
     const brokenImageRegistry = new Set();
+
+    let dynamicNetProfile = null;
+    let lastProfileCompute = 0;
 
     // --- Concurrency Control ---
     class Semaphore {
@@ -64,9 +86,8 @@
     let storageDirty = false;
     let storageSaveTimeout;
 
-    const perf = { successes: 0, failures: 0, probesMade: 0, preemptiveSuccess: 0, preemptiveFail: 0, broadcastSuccess: 0 };
+    const perf = { successes: 0, failures: 0, probesMade: 0, broadcastSuccess: 0 };
 
-    // --- Logging ---
     function log(...args) {
         if (!CONFIG.DEBUG) return;
         console.debug('[BatoFixer]', ...args);
@@ -82,7 +103,6 @@
         console.warn('[BatoFixer][WARN]', msg, shortSrc);
     }
 
-    // --- Storage ---
     function loadFromStorage() {
         try {
             const c = localStorage.getItem(CONFIG.STORAGE_KEY_CACHE);
@@ -94,6 +114,11 @@
             if (k) {
                 knownGoodServers = new Set(JSON.parse(k));
                 log('Loaded knownGoodServers:', knownGoodServers.size, 'servers');
+            }
+            const s = localStorage.getItem(CONFIG.STORAGE_KEY_STATS);
+            if (s) {
+                hostStats = new Map(JSON.parse(s));
+                log('Loaded hostStats:', hostStats.size, 'hosts');
             }
         } catch (e) {
             log('Storage load error:', e);
@@ -112,8 +137,18 @@
                 const servers = Array.from(knownGoodServers);
                 knownGoodServers = new Set(servers.slice(-CONFIG.MAX_SERVER_CAP));
             }
+            if (hostStats.size > CONFIG.HOST_STATS_LIMIT) {
+                const entries = Array.from(hostStats.entries());
+                entries.sort((a, b) => {
+                    const av = a[1] && a[1].lastUpdatedAt ? a[1].lastUpdatedAt : 0;
+                    const bv = b[1] && b[1].lastUpdatedAt ? b[1].lastUpdatedAt : 0;
+                    return bv - av;
+                });
+                hostStats = new Map(entries.slice(0, CONFIG.HOST_STATS_LIMIT));
+            }
             localStorage.setItem(CONFIG.STORAGE_KEY_CACHE, JSON.stringify([...serverCache]));
             localStorage.setItem(CONFIG.STORAGE_KEY_CONTEXT, JSON.stringify([...knownGoodServers]));
+            localStorage.setItem(CONFIG.STORAGE_KEY_STATS, JSON.stringify([...hostStats]));
             log('Storage saved:', { serverCache: serverCache.size, knownGood: knownGoodServers.size });
             storageDirty = false;
         } catch (e) {
@@ -128,7 +163,157 @@
         }
     }
 
-    // --- Helpers ---
+    function getOrInitHostStat(host) {
+        let stat = hostStats.get(host);
+        if (!stat) {
+            stat = {
+                successes: 0,
+                failures: 0,
+                lastSuccessAt: 0,
+                avgLatencyMs: 0,
+                lastUpdatedAt: Date.now()
+            };
+            hostStats.set(host, stat);
+        }
+        return stat;
+    }
+
+    function decayHostStat(stat, now) {
+        const last = stat.lastUpdatedAt || now;
+        const dt = now - last;
+        if (dt <= 0) return;
+        const halfLife = CONFIG.STATS_HALF_LIFE_MS;
+        if (!halfLife || halfLife <= 0) return;
+        const factor = Math.pow(0.5, dt / halfLife);
+        stat.successes *= factor;
+        stat.failures *= factor;
+        stat.lastUpdatedAt = now;
+    }
+
+    function recordHostResult(host, success, latencyMs) {
+        if (!host) return;
+        const now = Date.now();
+        const stat = getOrInitHostStat(host);
+        decayHostStat(stat, now);
+
+        if (success) {
+            stat.successes += 1;
+            stat.lastSuccessAt = now;
+        } else {
+            stat.failures += 1;
+        }
+
+        if (latencyMs && latencyMs > 0) {
+            if (!stat.avgLatencyMs) stat.avgLatencyMs = latencyMs;
+            else stat.avgLatencyMs = stat.avgLatencyMs * 0.7 + latencyMs * 0.3;
+        }
+
+        stat.lastUpdatedAt = now;
+        markStorageDirty();
+    }
+
+    function computeNetworkProfile() {
+        const profile = {
+            probeTimeoutMs: CONFIG.PROBE_TIMEOUT,
+            maxConcurrentProbes: CONFIG.MAX_CONCURRENT_PROBES,
+            waveSize: 3
+        };
+
+        try {
+            const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+            if (conn) {
+                const et = (conn.effectiveType || '').toLowerCase();
+                const down = typeof conn.downlink === 'number' ? conn.downlink : 0;
+
+                if (et === '4g' && down >= 5) {
+                    profile.probeTimeoutMs = Math.max(CONFIG.PROBE_TIMEOUT, 2200);
+                    profile.maxConcurrentProbes = CONFIG.MAX_CONCURRENT_PROBES;
+                    profile.waveSize = 3;
+                } else if (et === '4g' || et === '3g' || down > 0) {
+                    profile.probeTimeoutMs = Math.max(CONFIG.PROBE_TIMEOUT * 1.8, 3500);
+                    profile.maxConcurrentProbes = Math.max(2, Math.min(CONFIG.MAX_CONCURRENT_PROBES, 4));
+                    profile.waveSize = 2;
+                } else if (et === '2g' || et === 'slow-2g') {
+                    profile.probeTimeoutMs = Math.max(CONFIG.PROBE_TIMEOUT * 2.5, 6000);
+                    profile.maxConcurrentProbes = 2;
+                    profile.waveSize = 1;
+                }
+            }
+        } catch (e) {
+            log('networkProfile:connection-error', e);
+        }
+
+        const latencies = [];
+        hostStats.forEach(stat => {
+            if (!stat || !stat.avgLatencyMs || stat.avgLatencyMs <= 0) return;
+            latencies.push(stat.avgLatencyMs);
+        });
+
+        if (latencies.length > 0) {
+            latencies.sort((a, b) => a - b);
+            const idx = Math.floor(latencies.length * 0.75);
+            const typical = latencies[Math.min(idx, latencies.length - 1)];
+
+            const minTimeout = CONFIG.PROBE_TIMEOUT;
+            const maxTimeout = 8000;
+            const suggested = typical * 3;
+            profile.probeTimeoutMs = Math.max(minTimeout, Math.min(maxTimeout, Math.max(profile.probeTimeoutMs, suggested)));
+
+            if (typical > 3500) {
+                profile.waveSize = 1;
+                profile.maxConcurrentProbes = Math.min(profile.maxConcurrentProbes, 2);
+            } else if (typical > 2200) {
+                profile.waveSize = Math.min(profile.waveSize, 2);
+                profile.maxConcurrentProbes = Math.min(profile.maxConcurrentProbes, 3);
+            }
+        }
+        profile.maxConcurrentProbes = Math.max(1, Math.min(CONFIG.MAX_CONCURRENT_PROBES, Math.floor(profile.maxConcurrentProbes || 1)));
+
+        if (globalLimiter && typeof globalLimiter.max === 'number') {
+            globalLimiter.max = profile.maxConcurrentProbes;
+        }
+
+        return profile;
+    }
+
+    function getNetworkProfile() {
+        const now = Date.now();
+        if (!dynamicNetProfile || now - lastProfileCompute > 5000) {
+            dynamicNetProfile = computeNetworkProfile();
+            lastProfileCompute = now;
+            log('networkProfile:update', dynamicNetProfile);
+        }
+        return dynamicNetProfile;
+    }
+
+    function computeHostScore(host, totalTries, now) {
+        const stat = hostStats.get(host);
+        const s = stat ? stat.successes : 0;
+        const f = stat ? stat.failures : 0;
+        const tries = Math.max(0, s + f);
+        const successRate = tries > 0 ? (s / tries) : 0.5;
+
+        const globalTries = Math.max(1, totalTries || tries || 1);
+        const ucb = successRate + CONFIG.UCB_K * Math.sqrt(Math.log(globalTries + 1) / (tries + 1));
+
+        let latencyFactor = 1;
+        if (stat && stat.avgLatencyMs && stat.avgLatencyMs > 0) {
+            const C = CONFIG.LATENCY_BASE_MS;
+            latencyFactor = C / (C + stat.avgLatencyMs);
+        }
+
+        let recencyBoost = 0;
+        if (stat && stat.lastSuccessAt) {
+            const ageMs = now - stat.lastSuccessAt;
+            const windowMs = 30 * 60 * 1000;
+            if (ageMs < windowMs) {
+                recencyBoost = 0.2 * (1 - ageMs / windowMs);
+            }
+        }
+
+        return ucb * latencyFactor + recencyBoost;
+    }
+
     function getStatus(img) {
         return img.dataset.batoStatus || '';
     }
@@ -159,6 +344,10 @@
         };
     }
 
+    function getHostKeyFromUrl(url) {
+        return url.split('/').slice(0, 3).join('/');
+    }
+
     function getServerSignature(p, n, r, t) { return `${p}|${n}|${r}|${t}`; }
 
     function getCacheKeyFromSrc(src) {
@@ -178,7 +367,6 @@
         const host = `${prefix}${numberStr}.${root}.${tld}`;
         const isNew = !knownGoodServers.has(sig);
         if (!isNew) {
-            // LRU touch: move to the end without logging
             knownGoodServers.delete(sig);
             knownGoodServers.add(sig);
             return;
@@ -189,7 +377,6 @@
         markStorageDirty();
     }
 
-    // --- Queue System ---
     function addToQueue(img, priority = 'low') {
         if (shouldIgnore(img.src) || img.dataset.batoQueued) return;
 
@@ -202,7 +389,7 @@
         img.dataset.batoQueued = priority;
         setStatus(img, 'queued');
         processingQueue[priority].push(img);
-        logInfo(img, `Queued as ${priority}`);
+        logInfo(img, `STEP2: queued for fixing (priority: ${priority})`);
         processQueue();
     }
 
@@ -239,9 +426,10 @@
     }
 
     
-    // Returns an object: { promise, cancel() }
     function probeSingle(url) {
-        const hostKey = url.split('/').slice(0, 3).join('/');
+        const hostKey = getHostKeyFromUrl(url);
+        const parsed = parseSubdomain(url);
+        const host = parsed ? `${parsed.prefix}${parsed.numberStr}.${parsed.root}.${parsed.tld}` : hostKey.replace(/^https?:\/\//, '');
         let cancelFn = () => {};
 
         const promise = (async () => {
@@ -251,22 +439,28 @@
 
             await globalLimiter.acquire();
             perf.probesMade++;
-            
+            const start = Date.now();
+
+            const profile = getNetworkProfile();
+            const timeoutMs = profile && profile.probeTimeoutMs ? profile.probeTimeoutMs : CONFIG.PROBE_TIMEOUT;
+
             return new Promise((resolve, reject) => {
                 const img = new Image();
                 img.referrerPolicy = 'no-referrer';
                 
                 let isFinished = false;
+                let checkTimer = null;
 
                 const cleanup = () => {
                     isFinished = true;
-                    // crucial: breaking the src connection frees bandwidth
                     img.onload = null;
                     img.onerror = null;
+                    if (checkTimer) {
+                        clearInterval(checkTimer);
+                        checkTimer = null;
+                    }
                     globalLimiter.release(); 
                 };
-
-                // This function allows the parent to kill this probe
                 cancelFn = () => {
                     if (!isFinished) {
                         img.src = ''; 
@@ -275,24 +469,46 @@
                     }
                 };
 
+                const markSuccess = () => {
+                    if (isFinished) return;
+                    clearTimeout(timer);
+                    if (checkTimer) {
+                        clearInterval(checkTimer);
+                        checkTimer = null;
+                    }
+                    recordHostResult(host, true, Date.now() - start);
+                    cleanup();
+                    img.src = '';
+                    resolve(url);
+                };
+
+                checkTimer = setInterval(() => {
+                    if (img.naturalWidth > 1) markSuccess();
+                }, 150);
+
                 const timer = setTimeout(() => {
                     if (!isFinished) {
                         failedCache.add(hostKey);
                         if (failedCache.size > CONFIG.FAILED_CACHE_LIMIT) failedCache.clear();
+                        recordHostResult(host, false, timeoutMs);
+                        perf.failures++;
                         cleanup();
                         img.src = ''; 
                         reject('timeout');
                     }
-                }, CONFIG.PROBE_TIMEOUT);
+                }, timeoutMs);
 
                 img.onload = () => {
-                    if (isFinished) return;
-                    clearTimeout(timer);
-                    if (img.width > 1) {
-                        cleanup();
-                        resolve(url);
-                    } else {
+                    if (img.width > 1) markSuccess();
+                    else if (!isFinished) {
+                        clearTimeout(timer);
+                        if (checkTimer) {
+                            clearInterval(checkTimer);
+                            checkTimer = null;
+                        }
                         failedCache.add(hostKey);
+                        recordHostResult(host, false, Date.now() - start);
+                        perf.failures++;
                         cleanup();
                         reject('empty');
                     }
@@ -301,7 +517,13 @@
                 img.onerror = () => {
                     if (isFinished) return;
                     clearTimeout(timer);
+                    if (checkTimer) {
+                        clearInterval(checkTimer);
+                        checkTimer = null;
+                    }
                     failedCache.add(hostKey);
+                    recordHostResult(host, false, Date.now() - start);
+                    perf.failures++;
                     cleanup();
                     reject('error');
                 };
@@ -314,16 +536,16 @@
     }
 
     function findFastestCandidate(candidates) {
-        // REDUCED: Was 6. Lowering wave size helps slow connections.
-        const WAVE_SIZE = 3; 
-        
+        const profile = getNetworkProfile();
+        const WAVE_SIZE = profile && profile.waveSize ? profile.waveSize : 3;
+
         if (candidates.length === 0) return Promise.reject('No candidates');
 
         return new Promise((resolve, reject) => {
             let active = 0;
             let index = 0;
             let resolved = false;
-            const runningProbes = new Set(); // Track active probes to kill them later
+            const runningProbes = new Set();
 
             const killLosers = () => {
                 runningProbes.forEach(probe => probe.cancel());
@@ -339,7 +561,7 @@
                 }
 
                 const url = candidates[index++];
-                const hostKey = url.split('/').slice(0, 3).join('/');
+                const hostKey = getHostKeyFromUrl(url);
                 
                 // Skip cached failures immediately
                 if (failedCache.has(hostKey)) {
@@ -349,14 +571,13 @@
 
                 active++;
                 
-                // probeSingle now returns { promise, cancel }
                 const probe = probeSingle(url);
                 runningProbes.add(probe);
 
                 probe.promise.then(validUrl => {
                     if (!resolved) {
                         resolved = true;
-                        killLosers(); // <--- This fixes the "top to bottom" lag
+                        killLosers();
                         resolve(validUrl);
                     }
                 }).catch((reason) => {
@@ -375,40 +596,111 @@
         });
     }
 
-    function generateCandidates(parsed) {
+    function generateCandidates(parsed, options = {}) {
+        const deep = !!options.deep;
         const cand = [];
         const add = (p, n, r, t, prio) => {
             const url = `https://${p}${String(n).padStart(2, '0')}.${r}.${t}${parsed.path}`;
             cand.push({ url, p: prio, host: `${p}${String(n).padStart(2, '0')}.${r}.${t}` });
         };
 
-        // 1. Known good servers (highest priority)
+        MASTER_STATIC_SERVERS.forEach((host, idx) => {
+            const m = host.match(/^([a-z]+)(\d+)\.([a-z0-9\-]+)\.([a-z]{2,})$/i);
+            if (!m) return;
+            const p = m[1].toLowerCase();
+            const n = m[2];
+            const r = m[3].toLowerCase();
+            const t = m[4].toLowerCase();
+            add(p, n, r, t, -2 + idx * 0.01);
+        });
+
         Array.from(knownGoodServers).reverse().forEach((sig, i) => {
             const [p, n, r, t] = sig.split('|');
             if (p !== parsed.prefix || n !== parsed.numberStr) add(p, n, r, t, -1 + (i * 0.01));
         });
 
-        // 2. Per-path cache
         const pathKey = getCacheKeyFromSrc(`https://${parsed.prefix}${parsed.numberStr}.${parsed.root}.${parsed.tld}${parsed.path}`);
         if (pathKey && serverCache.has(pathKey)) {
             const c = serverCache.get(pathKey);
-            add(c.prefix, c.number, c.root, c.tld, 0);
+            add(c.prefix, c.number, c.root, c.tld, -0.5);
             log('cache:hit', { key: pathKey, host: `${c.prefix}${c.number}.${c.root}.${c.tld}` });
         }
 
-        // 3. Heuristics
-        if (parsed.prefix === 'k') ['n','x','t'].forEach(l => add(l, parsed.numberStr, parsed.root, parsed.tld, 1));
-        ['03','01','02','04','05','00'].forEach((n,i) => { if(n !== parsed.numberStr) add(parsed.prefix, n, parsed.root, parsed.tld, 2+i*0.1); });
-        FALLBACK_PREFIXES.filter(l => l !== parsed.prefix && l !== 'k').forEach((l,i) => add(l, parsed.numberStr, parsed.root, parsed.tld, 3+i*0.1));
-        FALLBACK_ROOTS.forEach(root => { const [r,t] = root.split('.'); if(r !== parsed.root) add(parsed.prefix, parsed.numberStr, r, t, 4); });
+        if (parsed.prefix === 'k') ['n', 'x', 't'].forEach(l => add(l, parsed.numberStr, parsed.root, parsed.tld, 1));
+        ['03', '01', '02', '04', '05', '00'].forEach((n, i) => {
+            if (n !== parsed.numberStr) add(parsed.prefix, n, parsed.root, parsed.tld, 2 + i * 0.1);
+        });
+        FALLBACK_PREFIXES
+            .filter(l => l !== parsed.prefix && l !== 'k')
+            .forEach((l, i) => add(l, parsed.numberStr, parsed.root, parsed.tld, 3 + i * 0.1));
+
+        const preferredNumbers = ['03', '01', '02', '04', '05', '00', '06', '07', '08', '09', '10', '11', '12', '14'];
+        const orderedRoots = deep
+            ? [
+                ...FALLBACK_ROOTS.filter(r => r.startsWith('mb') || r === 'bato.to'),
+                ...FALLBACK_ROOTS.filter(r => !(r.startsWith('mb') || r === 'bato.to'))
+            ]
+            : FALLBACK_ROOTS;
+
+        orderedRoots.forEach((root, rootIndex) => {
+            const parts = root.split('.');
+            const r = parts[0];
+            const t = parts[1];
+            if (!r || !t || r === parsed.root) return;
+
+            STRONG_FALLBACK_PREFIXES.forEach((prefix, pIndex) => {
+                preferredNumbers.forEach((n, i) => {
+                    if (prefix === parsed.prefix && n === parsed.numberStr && r === parsed.root && t === parsed.tld) return;
+                    add(prefix, n, r, t, 2 + rootIndex * 0.1 + pIndex * 0.02 + i * 0.001);
+                });
+            });
+
+            add(parsed.prefix, parsed.numberStr, r, t, 5 + rootIndex * 0.1);
+
+            preferredNumbers.forEach((n, i) => {
+                if (n === parsed.numberStr) return;
+                add(parsed.prefix, n, r, t, 5.5 + rootIndex * 0.1 + i * 0.01);
+            });
+        });
 
         const unique = new Set();
-        const final = cand.sort((a,b) => a.p - b.p)
+        const maxAttempts = deep ? CONFIG.MAX_ATTEMPTS * 2 : CONFIG.MAX_ATTEMPTS;
+
+        let totalTries = 0;
+        hostStats.forEach(stat => {
+            const s = stat && stat.successes ? stat.successes : 0;
+            const f = stat && stat.failures ? stat.failures : 0;
+            totalTries += Math.max(0, s + f);
+        });
+        const now = Date.now();
+        const hostScoreCache = new Map();
+
+        function getScoreForHost(host) {
+            if (hostScoreCache.has(host)) return hostScoreCache.get(host);
+            const score = computeHostScore(host, totalTries, now);
+            hostScoreCache.set(host, score);
+            return score;
+        }
+
+        cand.forEach(c => {
+            c.score = getScoreForHost(c.host);
+        });
+
+        const sorted = cand.sort((a, b) => {
+            if (a.score !== b.score) return b.score - a.score; 
+            return a.p - b.p; 
+        });
+
+        const final = sorted
             .filter(c => !unique.has(c.url) && unique.add(c.url))
             .map(c => c.url)
-            .slice(0, CONFIG.MAX_ATTEMPTS);
+            .slice(0, maxAttempts);
 
-        log('candidate:list', { count: final.length, sample: cand.slice(0,5).map(c => c.host) });
+        log('candidate:list', {
+            mode: deep ? 'deep' : 'normal',
+            count: final.length,
+            sample: sorted.slice(0,5).map(c => ({ host: c.host, score: c.score.toFixed(3) }))
+        });
         return final;
     }
 
@@ -418,6 +710,7 @@
 
         const host = `${ok.prefix}${ok.numberStr}.${ok.root}.${ok.tld}`;
         log('fix:applied', host);
+        logInfo(img, `STEP3: applied working server ${host}`);
 
         const pathKey = getCacheKeyFromSrc(img.dataset.originalSrc || img.src);
         if (pathKey) {
@@ -437,7 +730,6 @@
         delete img.dataset.batoFixStart;
         brokenImageRegistry.delete(img);
 
-        // Broadcast to other broken images
         let broadcastCount = 0;
         brokenImageRegistry.forEach(otherImg => {
             if (otherImg === img || otherImg.dataset.batoFixing === 'done') return;
@@ -470,108 +762,90 @@
             broadcastCount++;
         });
 
-        if (broadcastCount > 0) log('broadcast:start', { count: broadcastCount });
+        if (broadcastCount > 0) {
+            log('STEP3: broadcasting working server to other broken images', { count: broadcastCount, host });
+        }
     }
 
     async function fixImage(img) {
         const status = getStatus(img);
-        if (status === 'probing' || status === 'preemptive' || status === 'broadcast' || status === 'done') return;
+        if (status === 'probing' || status === 'broadcast' || status === 'done') return;
 
-        logInfo(img, 'fix:start');
-        img.dataset.batoFixing = 'true';
-        setStatus(img, 'probing');
+        logInfo(img, 'STEP3: start fix (contextual + search)');
+        img.dataset.batoFixing = 'probing';
         img.dataset.batoFixStart = Date.now().toString();
+        setStatus(img, 'probing');
 
         const parsed = parseSubdomain(img.src);
         if (!parsed) {
+            logWarn(img, 'STEP3: cannot parse image URL, giving up');
             img.dataset.batoFixing = 'failed';
             setStatus(img, 'failed');
-            logWarn(img, 'fix:parse-failed');
+            return;
+        }
+
+        const retries = parseInt(img.dataset.batoRetries || '0', 10) || 0;
+        const deep = retries > 0;
+        const candidates = generateCandidates(parsed, { deep });
+        if (candidates.length === 0) {
+            logWarn(img, 'STEP3: no candidate servers found');
+            img.dataset.batoFixing = 'failed';
+            setStatus(img, 'failed');
             return;
         }
 
         try {
-            const candidates = generateCandidates(parsed);
-            const winner = await findFastestCandidate(candidates);
-            applyFix(img, winner);
-        } catch (e) {
+            const validUrl = await findFastestCandidate(candidates);
+            applyFix(img, validUrl);
+        } catch (err) {
+            logWarn(img, `STEP3: all candidate servers failed (${err})`);
             img.dataset.batoFixing = 'failed';
             setStatus(img, 'failed');
-            perf.failures++;
-            logWarn(img, 'fix:all-probes-failed');
         }
     }
 
-    function preemptiveFix(img) {
-        const currentStatus = getStatus(img);
-        if (currentStatus && currentStatus !== 'failed') return false;
-        if (knownGoodServers.size === 0) return false;
+    function preemptiveKtoN(img) {
         if (shouldIgnore(img.src)) return false;
+        if (img.dataset.batoPreemptiveApplied === 'true') return false;
+
         const parsed = parseSubdomain(img.src);
-        if (!parsed) return false;
+        if (!parsed || parsed.prefix !== 'k') return false;
 
-        const servers = Array.from(knownGoodServers);
-        const sig = servers[servers.length - 1];
-        const [p, n, r, t] = sig.split('|');
-        if (p === parsed.prefix && n === parsed.numberStr) return false;
+        const pathKey = parsed.path.split('/').filter(Boolean).slice(0, 3).join('/');
+        const cacheKey = `${parsed.root}-${pathKey}`;
 
-        const newUrl = `https://${p}${n}.${r}.${t}${parsed.path}`;
-        const host = `${p}${n}.${r}.${t}`;
+        let newPrefix = 'n';
+        let newNumber = parsed.numberStr;
+        let newRoot = parsed.root;
+        let newTld = parsed.tld;
 
-        logInfo(img, `preemptive:start → ${host}`);
-        img.dataset.originalSrc = img.src;
-        img.dataset.batoPreemptive = 'true';
-        img.dataset.batoFixing = 'true';
-        setStatus(img, 'preemptive');
+        if (serverCache.has(cacheKey)) {
+            const cached = serverCache.get(cacheKey);
+            log('STEP1: using cached server for path', {
+                cacheKey,
+                host: `${cached.prefix}${cached.number}.${cached.root}.${cached.tld}`
+            });
+            newPrefix = cached.prefix || newPrefix;
+            newNumber = cached.number || newNumber;
+            newRoot = cached.root || newRoot;
+            newTld = cached.tld || newTld;
+        }
+
+        const newHost = `${newPrefix}${String(newNumber).padStart(2, '0')}.${newRoot}.${newTld}`;
+        const newUrl = `https://${newHost}${parsed.path}`;
+
+        logInfo(img, `STEP1: preemptive k→${newPrefix} switch to ${newHost}`);
+
+        img.dataset.originalSrc = img.dataset.originalSrc || img.src;
         img.referrerPolicy = 'no-referrer';
 
-        const slowTimer = setTimeout(() => {
-            if (img.dataset.batoPreemptive === 'true' && !img.complete) {
-                logWarn(img, 'preemptive:slow');
-                img.src = img.dataset.originalSrc;
-                img.dataset.batoPreemptive = 'failed';
-                img.dataset.batoFixing = '';
-                setStatus(img, 'queued');
-                addToQueue(img, 'high');
-            }
-        }, 1500);
+        if (img.srcset) {
+            img.dataset.originalSrcset = img.dataset.originalSrcset || img.srcset;
+            const baseRe = /https?:\/\/[a-z]+\d+\.[a-z0-9\-]+\.[a-z]{2,}/gi;
+            img.srcset = img.srcset.replace(baseRe, `https://${newHost}`);
+        }
 
-        const cleanup = () => clearTimeout(slowTimer);
-
-        img.addEventListener('error', () => {
-            cleanup();
-            img.src = img.dataset.originalSrc;
-            img.dataset.batoPreemptive = 'failed';
-            img.dataset.batoFixing = '';
-            setStatus(img, 'queued');
-            perf.preemptiveFail++;
-            logWarn(img, 'preemptive:error');
-            addToQueue(img, 'high');
-        }, { once: true });
-
-        img.addEventListener('load', () => {
-            cleanup();
-            if (img.naturalWidth > 0) {
-                img.dataset.batoPreemptive = '';
-                img.dataset.batoFixing = 'done';
-                setStatus(img, 'done');
-                perf.preemptiveSuccess++;
-                perf.successes++;
-                logInfo(img, 'preemptive:success');
-                const ok = { prefix: p, numberStr: n, root: r, tld: t };
-                registerGoodServer(ok);
-                const pathKey = getCacheKeyFromSrc(img.dataset.originalSrc || img.src);
-                if (pathKey) {
-                    serverCache.set(pathKey, { prefix: ok.prefix, number: ok.numberStr, root: ok.root, tld: ok.tld });
-                    markStorageDirty();
-                }
-                delete img.dataset.batoFixStart;
-                brokenImageRegistry.delete(img);
-            } else {
-                img.dispatchEvent(new Event('error'));
-            }
-        }, { once: true });
-
+        img.dataset.batoPreemptiveApplied = 'true';
         img.src = newUrl;
         return true;
     }
@@ -580,7 +854,6 @@
         log('init', 'BatoFixer v8 (Fixes ALL bato CDN images - thumbs, avatars, covers, panels)');
         loadFromStorage();
 
-        // Harvest good servers from any successful load
         document.addEventListener('load', e => {
             if (e.target.tagName === 'IMG' && !shouldIgnore(e.target.src) && e.target.naturalWidth > 0) {
                 const p = parseSubdomain(e.target.src);
@@ -591,9 +864,11 @@
             }
         }, true);
 
-        // Initial scan
         document.querySelectorAll('img').forEach(img => {
             if (shouldIgnore(img.src)) return;
+
+            // Step 1: simple k→n swap (legacy behavior).
+            preemptiveKtoN(img);
 
             if (img.complete) {
                 if (img.naturalWidth === 0) {
@@ -606,34 +881,29 @@
             } else {
                 img.addEventListener('error', () => addToQueue(img, 'high'), { once: true });
             }
-
-            // Preemptive on any broken-looking image
-            if (img.naturalWidth === 0 && knownGoodServers.size > 0) {
-                preemptiveFix(img);
-            }
         });
 
-        // Dynamic content
         new MutationObserver(mutations => {
             mutations.forEach(m => m.addedNodes.forEach(n => {
                 if (n.tagName === 'IMG' && !shouldIgnore(n.src)) {
+                    // Step 1 for new images: simple k→n swap.
+                    preemptiveKtoN(n);
                     if (!n.complete) n.addEventListener('error', () => addToQueue(n, 'high'), { once: true });
-                    if (knownGoodServers.size > 0) preemptiveFix(n);
                 } else if (n.querySelectorAll) {
                     n.querySelectorAll('img').forEach(i => {
                         if (!shouldIgnore(i.src) && !i.complete) {
+                            // Step 1 for discovered images: simple k→n swap.
+                            preemptiveKtoN(i);
                             i.addEventListener('error', () => addToQueue(i, 'high'), { once: true });
-                            if (knownGoodServers.size > 0) preemptiveFix(i);
                         }
                     });
                 }
             }));
         }).observe(document.body, { childList: true, subtree: true });
 
-        // Cleanup & stats
         setInterval(() => {
             const now = Date.now();
-            document.querySelectorAll('[data-bato-status="probing"], [data-bato-status="preemptive"], [data-bato-status="broadcast"]').forEach(img => {
+            document.querySelectorAll('[data-bato-status="probing"], [data-bato-status="broadcast"]').forEach(img => {
                 if ((now - parseInt(img.dataset.batoFixStart || 0)) > 20000) {
                     const retries = parseInt(img.dataset.batoRetries || '0', 10) || 0;
                     if (retries < CONFIG.MAX_RETRIES_PER_IMAGE) {
@@ -658,7 +928,6 @@
                     successes: perf.successes,
                     failures: perf.failures,
                     probes: perf.probesMade,
-                    preemptive: `${perf.preemptiveSuccess}/${perf.preemptiveSuccess + perf.preemptiveFail}`,
                     broadcast: perf.broadcastSuccess,
                     registry: brokenImageRegistry.size,
                     goodServers: knownGoodServers.size
