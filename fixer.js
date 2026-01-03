@@ -1,6 +1,6 @@
 (() => {
   
-  const PROBE_TIMEOUT = 3500; 
+  const PROBE_TIMEOUT = 8000; 
   const MAX_ATTEMPTS = 30;
   const MAX_SERVER_NUM = 15;
   const RETRY_DELAY = 700; 
@@ -51,7 +51,7 @@
   
   
   const serverCache = new Map();
-  const failedCache = new Set();
+  const failedCache = new Map();
 
   const swarmHostMap = new Map();
   const swarmLeaderPromises = new Map();
@@ -123,6 +123,24 @@
 
   function hostBaseFromUrl(url) {
     return String(url).split('/').slice(0, 3).join('/');
+  }
+
+  function isTemporarilyFailedHost(cacheKey) {
+    const until = failedCache.get(cacheKey);
+    if (!until) return false;
+    if (until <= nowMs()) {
+      failedCache.delete(cacheKey);
+      return false;
+    }
+    return true;
+  }
+
+  function markHostFailed(cacheKey, reason) {
+    const now = nowMs();
+    const backoffMs = reason === 'timeout' ? 15000 : 120000;
+    const until = now + backoffMs;
+    const prev = failedCache.get(cacheKey) || 0;
+    failedCache.set(cacheKey, Math.max(prev, until));
   }
 
   function loadPersistentCache() {
@@ -264,7 +282,7 @@
   function probeUrl(url, timeout = PROBE_TIMEOUT) {
     return new Promise((resolve, reject) => {
       const cacheKey = hostBaseFromUrl(url);
-      if (failedCache.has(cacheKey)) {
+      if (isTemporarilyFailedHost(cacheKey)) {
         reject('cached-fail');
         return;
       }
@@ -275,7 +293,7 @@
       const t = setTimeout(() => {
         timedOut = true;
         img.src = "";
-        failedCache.add(cacheKey);
+        markHostFailed(cacheKey, 'timeout');
         reject('timeout');
       }, timeout);
 
@@ -285,7 +303,7 @@
           if (img.width > 1 || img.height > 1) {
             resolve(true);
           } else {
-            failedCache.add(cacheKey);
+            markHostFailed(cacheKey, 'empty');
             reject('empty');
           }
         }
@@ -294,7 +312,7 @@
       img.onerror = () => {
         if (!timedOut) {
           clearTimeout(t);
-          failedCache.add(cacheKey);
+          markHostFailed(cacheKey, 'error');
           reject('error');
         }
       };
@@ -532,11 +550,11 @@
     for (let i = 0; i < candidates.length; i++) {
       const url = candidates[i];
 
-      const serverPattern = url.split('/').slice(0, 3).join('/');
-      if (failedCache.has(serverPattern)) continue;
+      const serverPattern = hostBaseFromUrl(url);
+      if (isTemporarilyFailedHost(serverPattern)) continue;
 
       try {
-        const timeout = PROBE_TIMEOUT + (i > 5 ? 1000 : 0);
+        const timeout = PROBE_TIMEOUT + Math.min(4000, i * 250);
         await probeUrl(url, timeout);
 
         const successParsed = parseSubdomain(url);
@@ -557,7 +575,7 @@
         return tuple;
       } catch (e) {
         lastError = e;
-        if (e === 'timeout' && i > 10) break;
+        if (e === 'timeout' && i > 18) break;
       }
     }
     throw lastError || 'failed';
