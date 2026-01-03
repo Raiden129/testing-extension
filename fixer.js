@@ -12,7 +12,7 @@
   const PERSIST_DEBOUNCE_DELAY = 250;
 
   const STORAGE_KEY = 'batoFixCacheV1';
-  const CACHE_VERSION = 1;
+  const CACHE_VERSION = 3;
   const HOST_CACHE_MAX = 250;
   const URL_CACHE_MAX = 800;
 
@@ -62,6 +62,8 @@
   
   
   const processingImages = new WeakSet();
+  const pendingImages = new Set();
+  let pendingFlushTimer = null;
 
   function nowMs() {
     return Date.now();
@@ -148,7 +150,8 @@
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return;
       const parsed = safeJsonParse(raw);
-      if (!parsed || parsed.version !== CACHE_VERSION) return;
+      if (!parsed || typeof parsed.version !== 'number') return;
+      if (![1, 2, 3].includes(parsed.version)) return;
 
       const hosts = parsed.hosts && typeof parsed.hosts === 'object' ? parsed.hosts : {};
       const urls = parsed.urls && typeof parsed.urls === 'object' ? parsed.urls : {};
@@ -173,6 +176,30 @@
         const lastUsed = typeof entry.lastUsed === 'number' ? entry.lastUsed : 0;
         persistentUrlMeta.set(badUrl, { fixedUrl: entry.fixedUrl, lastUsed });
       }
+
+      if (parsed.version === 1) {
+        for (const [badUrl, entry] of Object.entries(urls)) {
+          if (!entry || typeof entry !== 'object') continue;
+          if (typeof entry.fixedUrl !== 'string') continue;
+          const lastUsed = typeof entry.lastUsed === 'number' ? entry.lastUsed : 0;
+
+          const badParsed = parseSubdomain(badUrl);
+          const fixedParsed = parseSubdomain(entry.fixedUrl);
+          if (!badParsed || !fixedParsed) continue;
+
+          const badBase = toBase(badParsed);
+          const tuple = toHostTuple(fixedParsed);
+          const prev = persistentHostMeta.get(badBase);
+          if (prev) {
+            if ((prev.lastUsed || 0) < lastUsed) prev.lastUsed = lastUsed;
+          } else {
+            persistentHostMeta.set(badBase, { host: tuple, lastUsed });
+          }
+          swarmHostMap.set(badBase, tuple);
+        }
+      }
+
+      if (parsed.version !== CACHE_VERSION) schedulePersist();
     } catch (e) {
     }
   }
@@ -189,6 +216,22 @@
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch {
     }
+  }
+
+  function enqueueImage(img) {
+    if (!img || img.tagName !== 'IMG' || !img.src) return;
+    if (pendingImages.has(img)) return;
+    pendingImages.add(img);
+    if (pendingFlushTimer) return;
+    pendingFlushTimer = setTimeout(() => {
+      pendingFlushTimer = null;
+      const batch = Array.from(pendingImages);
+      pendingImages.clear();
+      for (const queuedImg of batch) {
+        processNewImage(queuedImg);
+        setTimeout(() => checkImage(queuedImg), CHECK_DELAY);
+      }
+    }, 50);
   }
 
   function parseSubdomain(src) {
@@ -462,6 +505,16 @@
     const oldUrl = img.src;
     const newUrl = `https://${hostTuple.prefix}${String(hostTuple.number).padStart(2, '0')}.${hostTuple.root}.${hostTuple.tld}${parsed.path}`;
     try {
+      const badBase = toBase(parsed);
+      swarmHostMap.set(badBase, hostTuple);
+      const meta = persistentHostMeta.get(badBase);
+      if (meta) {
+        meta.host = hostTuple;
+        meta.lastUsed = nowMs();
+      } else {
+        persistentHostMeta.set(badBase, { host: hostTuple, lastUsed: nowMs() });
+      }
+
       persistentUrlMeta.set(oldUrl, { fixedUrl: newUrl, lastUsed: nowMs() });
       schedulePersist();
     } catch {
@@ -527,7 +580,7 @@
   }
 
   function broadcastSwarmFix(badBase, goodHostTuple) {
-    let count = 0;
+    const updated = [];
     document.querySelectorAll('img').forEach(img => {
       const p = parseSubdomain(img.src);
       if (!p) return;
@@ -537,9 +590,10 @@
       applyHostToImage(img, goodHostTuple, p);
       img.dataset.batoFixing = 'done';
       img.dataset.batoFixed = 'true';
-      count++;
+      updated.push(img);
     });
 
+    return updated;
   }
 
   async function leaderProbeAndSwarm(parsed) {
@@ -571,7 +625,11 @@
         const pathKey = parsed.path.split('/').slice(0, 3).join('/');
         const cacheKey = `${parsed.root}-${pathKey}`;
         serverCache.set(cacheKey, tuple);
-        broadcastSwarmFix(badBase, tuple);
+
+        const updatedImgs = broadcastSwarmFix(badBase, tuple);
+        for (const img of updatedImgs) {
+          setTimeout(() => checkImage(img), CHECK_DELAY);
+        }
         return tuple;
       } catch (e) {
         lastError = e;
@@ -593,6 +651,24 @@
     const parsed = parseSubdomain(img.src);
     if (!parsed) {
       img.dataset.batoFixing = '';
+      processingImages.delete(img);
+      return;
+    }
+
+    const exact = persistentUrlMeta.get(img.src);
+    if (exact && exact.fixedUrl) {
+      if (!img.dataset.originalSrc) img.dataset.originalSrc = img.src;
+      if (img.srcset && !img.dataset.originalSrcset) img.dataset.originalSrcset = img.srcset;
+      img.dataset.batoUrlPreemptive = 'true';
+      img.src = exact.fixedUrl;
+      if (img.srcset) {
+        const newSrcset = rewriteSrcset(img.srcset, exact.fixedUrl);
+        if (newSrcset) img.srcset = newSrcset;
+      }
+      exact.lastUsed = nowMs();
+      schedulePersist();
+      img.dataset.batoFixing = 'done';
+      img.dataset.batoFixed = 'true';
       processingImages.delete(img);
       return;
     }
@@ -634,13 +710,6 @@
       img.dataset.batoFixed = 'true';
       processingImages.delete(img);
 
-      setTimeout(() => {
-        document.querySelectorAll('img').forEach(candidateImg => {
-          if (candidateImg.complete && candidateImg.naturalWidth === 0 && candidateImg.dataset.batoFixing !== 'done') {
-            fixImage(candidateImg);
-          }
-        });
-      }, POST_SWARM_SCAN_DELAY);
       return;
     } catch (e) {
       lastError = e;
@@ -686,6 +755,8 @@
     const newUrl = `https://${newPrefix}${String(newNumber).padStart(2, '0')}.${newRoot}.${newTld}${parsed.path}`;
     
     img.dataset.originalSrc = img.src;
+    img.dataset.batoPreemptiveBadBase = toBase(parsed);
+    img.dataset.batoPreemptiveHost = JSON.stringify({ prefix: newPrefix, number: newNumber, root: newRoot, tld: newTld });
     img.src = newUrl;
     
     if (img.srcset) {
@@ -721,6 +792,33 @@
       return;
     }
 
+    if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth > 0 && img.dataset.batoPreemptiveHost && img.dataset.batoPreemptiveBadBase) {
+      try {
+        const tuple = safeJsonParse(img.dataset.batoPreemptiveHost);
+        if (tuple && typeof tuple.prefix === 'string' && typeof tuple.number === 'number' && typeof tuple.root === 'string' && typeof tuple.tld === 'string') {
+          const badBase = img.dataset.batoPreemptiveBadBase;
+          swarmHostMap.set(badBase, tuple);
+          const meta = persistentHostMeta.get(badBase);
+          if (meta) {
+            meta.host = tuple;
+            meta.lastUsed = nowMs();
+          } else {
+            persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
+          }
+
+          if (img.dataset.originalSrc) {
+            persistentUrlMeta.set(img.dataset.originalSrc, { fixedUrl: img.src, lastUsed: nowMs() });
+          }
+          schedulePersist();
+        }
+      } catch {
+      }
+      img.dataset.batoPreemptive = "done";
+      img.dataset.batoPreemptiveHost = '';
+      img.dataset.batoPreemptiveBadBase = '';
+      return;
+    }
+
     if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth === 0) {
       if (img.dataset.originalSrc) {
         img.src = img.dataset.originalSrc;
@@ -729,6 +827,8 @@
         }
       }
       img.dataset.batoPreemptive = "failed";
+      img.dataset.batoPreemptiveHost = '';
+      img.dataset.batoPreemptiveBadBase = '';
       fixImage(img);
       return;
     }
@@ -767,24 +867,19 @@
   function init() {
     ensurePersistentCacheKey();
     loadPersistentCache();
-    document.querySelectorAll('img').forEach(img => {
-      processNewImage(img);
-      setTimeout(() => checkImage(img), CHECK_DELAY);
-    });
+    document.querySelectorAll('img').forEach(enqueueImage);
 
     const observer = new MutationObserver((mutations) => {
       mutations.forEach(mutation => {
         mutation.addedNodes.forEach(node => {
           if (node.tagName === 'IMG') {
-            processNewImage(node);
-            setTimeout(() => checkImage(node), CHECK_DELAY);
+            enqueueImage(node);
           }
           
           if (node.querySelectorAll) {
             node.querySelectorAll('img').forEach(img => {
               if (!img.dataset.batoFixing) {
-                processNewImage(img);
-                setTimeout(() => checkImage(img), CHECK_DELAY);
+                enqueueImage(img);
               }
             });
           }
@@ -800,8 +895,7 @@
             img.dataset.batoPreemptive = "";
             img.dataset.batoSwarmPreemptive = "";
             setTimeout(() => {
-              processNewImage(img);
-              checkImage(img);
+              enqueueImage(img);
             }, ATTR_CHANGE_RESCAN_DELAY);
           }
         }
