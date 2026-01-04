@@ -7,7 +7,6 @@
   const CHECK_DELAY = 200;
   const K_PREEMPTIVE_VERIFY_DELAY = 800;
   const ERROR_EVENT_DEBOUNCE = 100;
-  const POST_SWARM_SCAN_DELAY = 1500;
   const ATTR_CHANGE_RESCAN_DELAY = 500;
   const PERSIST_DEBOUNCE_DELAY = 250;
 
@@ -625,17 +624,6 @@
     return out;
   }
 
-  function rewriteSrcset(srcset, workingUrl) {
-    if (!srcset) return null;
-    
-    const workingParsed = parseSubdomain(workingUrl);
-    if (!workingParsed) return null;
-    
-    const newBase = `https://${workingParsed.prefix}${String(workingParsed.number).padStart(2, '0')}.${workingParsed.root}.${workingParsed.tld}`;
-    
-    return srcset.replace(HOST_REWRITE_RE, newBase);
-  }
-
   function rewriteSrcsetToBase(srcset, newBase) {
     if (!srcset || !newBase) return null;
     return srcset.replace(HOST_REWRITE_RE, newBase);
@@ -780,11 +768,14 @@
     img.dataset.batoFixing = 'true';
 
     const fixed = meta.fixedUrl;
-    const fixedParsed = parseSubdomain(fixed);
-    const fixedBase = fixedParsed ? `https://${fixedParsed.prefix}${String(fixedParsed.number).padStart(2, '0')}.${fixedParsed.root}.${fixedParsed.tld}` : null;
+    let fixedBase = null;
+    try {
+      fixedBase = new URL(fixed).origin;
+    } catch {
+    }
     img.src = fixed;
     if (img.srcset) {
-      const newSrcset = fixedBase ? rewriteSrcsetToBase(img.srcset, fixedBase) : rewriteSrcset(img.srcset, fixed);
+      const newSrcset = fixedBase ? rewriteSrcsetToBase(img.srcset, fixedBase) : null;
       if (newSrcset) img.srcset = newSrcset;
     }
 
@@ -987,20 +978,7 @@
       return;
     }
 
-    const exact = persistentUrlMeta.get(img.src);
-    if (exact && exact.fixedUrl) {
-      if (!img.dataset.originalSrc) img.dataset.originalSrc = img.src;
-      if (img.srcset && !img.dataset.originalSrcset) img.dataset.originalSrcset = img.srcset;
-      img.dataset.batoUrlPreemptive = 'true';
-      img.src = exact.fixedUrl;
-      if (img.srcset) {
-        const newSrcset = rewriteSrcset(img.srcset, exact.fixedUrl);
-        if (newSrcset) img.srcset = newSrcset;
-      }
-      exact.lastUsed = nowMs();
-      schedulePersist();
-      img.dataset.batoFixing = 'done';
-      img.dataset.batoFixed = 'true';
+    if (applyExactUrlFixIfAny(img)) {
       processingImages.delete(img);
       return;
     }
@@ -1019,13 +997,6 @@
     }
 
     if (swarmHostMap.has(badBase)) {
-      try {
-        const meta = persistentHostMeta.get(badBase);
-        if (meta) meta.lastUsed = nowMs();
-        schedulePersist();
-      } catch {
-      }
-
       applyHostToImage(img, swarmHostMap.get(badBase), parsed);
       img.dataset.batoFixing = 'done';
       img.dataset.batoFixed = 'true';
@@ -1094,8 +1065,9 @@
       newRoot = cached.root;
       newTld = cached.tld;
     }
-    
-    const newUrl = `https://${newPrefix}${String(newNumber).padStart(2, '0')}.${newRoot}.${newTld}${parsed.path}`;
+
+    const newBase = `https://${newPrefix}${String(newNumber).padStart(2, '0')}.${newRoot}.${newTld}`;
+    const newUrl = `${newBase}${parsed.path}`;
     
     img.dataset.originalSrc = img.src;
     img.dataset.batoPreemptiveBadBase = toBase(parsed);
@@ -1104,7 +1076,7 @@
     
     if (img.srcset) {
       img.dataset.originalSrcset = img.srcset;
-      const newSrcset = rewriteSrcset(img.srcset, newUrl);
+      const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
       if (newSrcset) img.srcset = newSrcset;
     }
     
