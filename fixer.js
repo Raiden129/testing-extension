@@ -374,6 +374,7 @@
       }
       
       const img = new Image();
+      img.referrerPolicy = 'no-referrer';
       try {
         img.decoding = 'async';
         img.fetchPriority = 'low';
@@ -650,6 +651,7 @@
       });
     }
 
+    img.referrerPolicy = 'no-referrer';
     img.src = newUrl;
     if (img.srcset) {
       const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
@@ -711,7 +713,7 @@
     } catch {
     }
     img.src = newUrl;
-
+    img.referrerPolicy = 'no-referrer';
     if (img.srcset) {
       const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
       if (newSrcset) img.srcset = newSrcset;
@@ -745,6 +747,7 @@
 
     const newBase = `https://${known.prefix}${String(known.number).padStart(2, '0')}.${known.root}.${known.tld}`;
     const newUrl = `${newBase}${p.path}`;
+    img.referrerPolicy = 'no-referrer';
     img.src = newUrl;
     if (img.srcset) {
       const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
@@ -773,6 +776,7 @@
       fixedBase = new URL(fixed).origin;
     } catch {
     }
+    img.referrerPolicy = 'no-referrer';
     img.src = fixed;
     if (img.srcset) {
       const newSrcset = fixedBase ? rewriteSrcsetToBase(img.srcset, fixedBase) : null;
@@ -1072,6 +1076,7 @@
     img.dataset.originalSrc = img.src;
     img.dataset.batoPreemptiveBadBase = toBase(parsed);
     img.dataset.batoPreemptiveHost = JSON.stringify({ prefix: newPrefix, number: newNumber, root: newRoot, tld: newTld });
+    img.referrerPolicy = 'no-referrer';
     img.src = newUrl;
     
     if (img.srcset) {
