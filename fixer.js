@@ -1202,26 +1202,6 @@
     }
 
     if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth > 0 && img.dataset.batoPreemptiveHost && img.dataset.batoPreemptiveBadBase) {
-      try {
-        const tuple = safeJsonParse(img.dataset.batoPreemptiveHost);
-        if (tuple && typeof tuple.prefix === 'string' && typeof tuple.number === 'number' && typeof tuple.root === 'string' && typeof tuple.tld === 'string') {
-          const badBase = img.dataset.batoPreemptiveBadBase;
-          swarmHostMap.set(badBase, tuple);
-          const meta = persistentHostMeta.get(badBase);
-          if (meta) {
-            meta.host = tuple;
-            meta.lastUsed = nowMs();
-          } else {
-            persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
-          }
-
-          if (img.dataset.originalSrc) {
-            persistentUrlMeta.set(img.dataset.originalSrc, { fixedUrl: img.src, lastUsed: nowMs() });
-          }
-          schedulePersist();
-        }
-      } catch {
-      }
       img.dataset.batoPreemptive = "done";
       img.dataset.batoPreemptiveHost = '';
       img.dataset.batoPreemptiveBadBase = '';
