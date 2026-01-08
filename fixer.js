@@ -1255,7 +1255,11 @@
 
     if (applyExactUrlFixIfAny(img)) return;
 
-    if (applyKnownSwarmFixIfAny(img, parsed)) return;
+    const isThumbnail = img.src.includes('/thumb') || img.src.includes('/avatars');
+    
+    if (!isThumbnail) {                 
+      if (applyKnownSwarmFixIfAny(img, parsed)) return;
+    }
   }
 
   function init() {
