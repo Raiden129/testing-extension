@@ -10,6 +10,9 @@
   const ATTR_CHANGE_RESCAN_DELAY = 500;
   const PERSIST_DEBOUNCE_DELAY = 250;
 
+  const SLOW_LOAD_PREEMPT_DELAY = 1400;
+  const SLOW_LOAD_PREEMPT_TRIES = 4;
+
   const PROBE_PARALLEL = 3;
   const PROBE_PARALLEL_TRIES = 9;
 
@@ -18,36 +21,309 @@
   const HOST_CACHE_MAX = 250;
   const URL_CACHE_MAX = 800;
 
+  const BEST_HOST_STATS_KEY = 'batoBestFullHostStatsV1';
+  const BEST_HOST_STATS_MAX = 250;
+
   const PREFIX_PRIORITY_MB = ['n', 's', 'b', 'd'];
   const PREFIX_PRIORITY_MP = ['n', 's', 'b', 'd'];
   const EXTRA_PREFIXES = ['x', 't', 'w', 'm', 'c', 'u', 'k'];
 
+  const BEST_FULL_HOSTS = `
+    b01.mbimg.org b01.mbmyj.org b01.mbrtz.org b01.mbtba.org b01.mbwnp.org b01.mbxma.org b01.mbznp.org
+    d01.mbdny.org d01.mbimg.org d01.mbmyj.org d01.mbuul.org
+    n00.mbdny.org n00.mbqgu.org n00.mbuul.org n00.mbwnp.org
+    n01.mbdny.org n01.mbopg.org n01.mbwww.org n01.mbxma.org
+    n02.mbeaj.org n02.mbmyj.org n02.mbtmv.org n02.mbwbm.org n02.mbxma.org
+    n03.mbhiz.org
+    n04.mbdny.org n04.mbeaj.org n04.mbhiz.org n04.mbimg.org n04.mbqgu.org n04.mbtmv.org n04.mbxma.org n04.mbzcp.org n04.mbznp.org
+    n05.mbimg.org n05.mbmyj.org n05.mbuul.org n05.mbznp.org
+    n06.mbeaj.org n06.mbrtz.org n06.mbwbm.org n06.mbwww.org
+    n07.mbmyj.org n07.mbopg.org n07.mbqgu.org n07.mbrtz.org n07.mbtba.org n07.mbtmv.org n07.mbwnp.org n07.mbxma.org
+    n08.mbhiz.org
+    n09.mbfpu.org n09.mbhiz.org n09.mbzcp.org
+    n10.mbfpu.org n10.mbuul.org n10.mbwnp.org n10.mbwww.org n10.mbzcp.org n10.mbznp.org
+    n11.mbopg.org n11.mbwnp.org n11.mbwww.org n11.mbxma.org
+    n12.mbfpu.org n12.mbwbm.org
+    n14.mbmyj.org n14.mbxma.org
+    n15.mbfpu.org
+    s00.mpubn.org s03.mpqsc.org s03.mpypl.org s05.mpfip.org s06.mpqsc.org s06.mprnm.org s07.mpfip.org s09.mpfip.org s09.mpubn.org s10.mpmok.org s10.mprnm.org
+  `.trim().split(/\s+/);
+
+  const bestHostStats = new Map();
+  let bestHostStatsTimer = null;
+
+  const bestHostPreflightPromises = new Map();
+
+  function pruneBestHostStats(maxEntries) {
+    if (bestHostStats.size <= maxEntries) return;
+    const entries = Array.from(bestHostStats.entries());
+    entries.sort((a, b) => (a[1].lastUsed || 0) - (b[1].lastUsed || 0));
+    const toRemove = entries.slice(0, Math.max(0, bestHostStats.size - maxEntries));
+    for (const [k] of toRemove) bestHostStats.delete(k);
+  }
+
+  function loadBestHostStats() {
+    try {
+      const raw = localStorage.getItem(BEST_HOST_STATS_KEY);
+      if (!raw) return;
+      const parsed = safeJsonParse(raw);
+      if (!parsed || typeof parsed !== 'object') return;
+      const stats = parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {};
+      for (const [host, entry] of Object.entries(stats)) {
+        if (!host || typeof host !== 'string') continue;
+        if (!BEST_FULL_HOSTS.includes(host)) continue;
+        if (!entry || typeof entry !== 'object') continue;
+        const hits = typeof entry.hits === 'number' ? entry.hits : 0;
+        const fails = typeof entry.fails === 'number' ? entry.fails : 0;
+        const lastUsed = typeof entry.lastUsed === 'number' ? entry.lastUsed : 0;
+        bestHostStats.set(host, {
+          hits: Math.max(0, hits),
+          fails: Math.max(0, fails),
+          lastUsed
+        });
+      }
+      pruneBestHostStats(BEST_HOST_STATS_MAX);
+    } catch {
+    }
+  }
+
+  function persistBestHostStatsNow() {
+    try {
+      pruneBestHostStats(BEST_HOST_STATS_MAX);
+      const statsObj = {};
+      for (const [host, meta] of bestHostStats.entries()) {
+        statsObj[host] = {
+          hits: meta.hits || 0,
+          fails: meta.fails || 0,
+          lastUsed: meta.lastUsed || 0
+        };
+      }
+      const payload = {
+        version: 1,
+        savedAt: nowMs(),
+        stats: statsObj
+      };
+      localStorage.setItem(BEST_HOST_STATS_KEY, JSON.stringify(payload));
+    } catch {
+    }
+  }
+
+  function scheduleBestHostStatsPersist() {
+    try {
+      if (bestHostStatsTimer) return;
+      bestHostStatsTimer = setTimeout(() => {
+        bestHostStatsTimer = null;
+        persistBestHostStatsNow();
+      }, PERSIST_DEBOUNCE_DELAY);
+    } catch {
+    }
+  }
+
+  function getBestHostMeta(host) {
+    const existing = bestHostStats.get(host);
+    if (existing) return existing;
+    const meta = { hits: 0, fails: 0, lastUsed: 0 };
+    bestHostStats.set(host, meta);
+    return meta;
+  }
+
+  function recordBestHostSuccess(host) {
+    if (!host) return;
+    const meta = getBestHostMeta(host);
+    meta.hits = (meta.hits || 0) + 1;
+    meta.lastUsed = nowMs();
+    scheduleBestHostStatsPersist();
+  }
+
+  function recordBestHostFailure(host, reason) {
+    if (!host) return;
+    if (reason === 'cached-fail') return;
+    const meta = getBestHostMeta(host);
+    meta.fails = (meta.fails || 0) + 1;
+    meta.lastUsed = nowMs();
+    scheduleBestHostStatsPersist();
+  }
+
+  function bestHostScore(meta) {
+    const hits = meta && typeof meta.hits === 'number' ? meta.hits : 0;
+    const fails = meta && typeof meta.fails === 'number' ? meta.fails : 0;
+    // Laplace smoothing so new hosts start neutral (0.5).
+    return (hits + 1) / (hits + fails + 2);
+  }
+
+  function pickBestHostByStats(hosts) {
+    const pool = Array.isArray(hosts) ? hosts : [];
+    if (pool.length === 0) return null;
+
+    // Prefer hosts not currently in backoff.
+    const available = pool.filter(h => {
+      const base = `https://${h}`;
+      return !isTemporarilyFailedHost(base);
+    });
+    const candidates = available.length ? available : pool;
+
+    let best = [];
+    let bestScore = -1;
+    let bestHits = -1;
+    for (const host of candidates) {
+      const meta = bestHostStats.get(host) || { hits: 0, fails: 0, lastUsed: 0 };
+      const score = bestHostScore(meta);
+      const hits = meta.hits || 0;
+      if (score > bestScore || (score === bestScore && hits > bestHits)) {
+        bestScore = score;
+        bestHits = hits;
+        best = [host];
+      } else if (score === bestScore && hits === bestHits) {
+        best.push(host);
+      }
+    }
+    if (best.length === 0) return null;
+    return best[Math.floor(Math.random() * best.length)];
+  }
+
+  function pickRandomDistinct(arr, count) {
+    const a = Array.isArray(arr) ? arr.slice() : [];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = a[i];
+      a[i] = a[j];
+      a[j] = tmp;
+    }
+    return a.slice(0, Math.max(0, Math.min(count, a.length)));
+  }
+
+  async function tryBestFullHostsPreflight(parsed, tries = 4) {
+    if (!parsed) return null;
+    if (!BEST_FULL_HOSTS || BEST_FULL_HOSTS.length === 0) return null;
+
+    const first = pickBestHostByStats(BEST_FULL_HOSTS);
+    const restPool = first ? BEST_FULL_HOSTS.filter(h => h !== first) : BEST_FULL_HOSTS;
+    const rest = pickRandomDistinct(restPool, Math.max(0, tries - 1));
+    const picks = first ? [first, ...rest] : rest;
+
+    for (const host of picks) {
+      const url = `https://${host}${parsed.path}`;
+      try {
+        const timeout = Math.min(PROBE_TIMEOUT, 3500);
+        await probeUrl(url, timeout);
+        const okParsed = parseSubdomain(url);
+        if (!okParsed) continue;
+        recordBestHostSuccess(host);
+        return toHostTuple(okParsed);
+      } catch (e) {
+        recordBestHostFailure(host, e);
+      }
+    }
+    return null;
+  }
+
+  function isInOrNearViewport(el) {
+    try {
+      const r = el.getBoundingClientRect();
+      const vh = Math.max(1, window.innerHeight || 1);
+      return r.bottom > -vh * 0.5 && r.top < vh * 1.5;
+    } catch {
+      return true;
+    }
+  }
+
+  async function bestHostPreflightAndSwarm(parsed) {
+    const badBase = toBase(parsed);
+    if (swarmHostMap.has(badBase)) return swarmHostMap.get(badBase);
+
+    const existing = bestHostPreflightPromises.get(badBase);
+    if (existing) return await existing;
+
+    const p = (async () => {
+      const tuple = await tryBestFullHostsPreflight(parsed, SLOW_LOAD_PREEMPT_TRIES);
+      if (!tuple) return null;
+
+      return commitSwarmWin(badBase, tuple, parsed, true);
+    })().finally(() => {
+      bestHostPreflightPromises.delete(badBase);
+    });
+
+    bestHostPreflightPromises.set(badBase, p);
+    return await p;
+  }
+
+  function commitSwarmWin(badBase, tuple, parsed, mpStrict = false) {
+    swarmHostMap.set(badBase, tuple);
+
+    if (isMpRootLabel(parsed.root) && (!mpStrict || isMpRootLabel(tuple.root))) {
+      setMpFamilyWinner(tuple);
+      broadcastMpFamilyPreemptive(tuple);
+    }
+
+    const updatedImgs = broadcastSwarmFix(badBase, tuple);
+    for (const img of updatedImgs) setTimeout(() => checkImage(img), CHECK_DELAY);
+
+    setTimeout(() => {
+      try {
+        persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
+        schedulePersist();
+      } catch {
+      }
+      try {
+        serverCache.set(serverCacheKey(parsed), tuple);
+      } catch {
+      }
+    }, 0);
+
+    return tuple;
+  }
+
+  function scheduleSlowLoadBestHostPreflight(img, parsed) {
+    if (!img || !parsed) return;
+    if (!BEST_FULL_HOSTS || BEST_FULL_HOSTS.length === 0) return;
+    if (img.dataset.batoSlowPreflight === '1') return;
+    if (!isInOrNearViewport(img)) return;
+
+    img.dataset.batoSlowPreflight = '1';
+    const expectedSrc = img.src;
+    setTimeout(async () => {
+      try {
+        if (!img.isConnected) return;
+        if (img.src !== expectedSrc) return;
+        if (img.dataset.batoFixed === 'true' || img.dataset.batoFixing === 'done') return;
+        if (applyExactUrlFixIfAny(img)) return;
+
+        const p = parseSubdomain(img.src);
+        if (!p) return;
+
+        const badBase = toBase(p);
+        if (swarmHostMap.has(badBase)) return;
+
+        // If it's still not loaded, treat it as high-risk and try the fast preflight.
+        if (img.complete && img.naturalWidth > 0) return;
+        if (!img.complete || (img.complete && img.naturalWidth === 0)) {
+          await bestHostPreflightAndSwarm(p);
+        }
+      } catch {
+      }
+    }, SLOW_LOAD_PREEMPT_DELAY);
+  }
+
   const PREFERRED_NUM_ORDER_MP = [1, 10, 2, 5, 0, 6, 7, 8, 3, 4, 9, 12, 14, 15, 11, 13];
   const PREFERRED_NUM_ORDER_MB = [1, 0, 9, 2, 8, 7, 5, 4, 3, 10, 6, 11, 12, 15, 14, 13];
 
-  const ROOT_PRIORITY_MP = [
-    'mbwww.org', 'mbwbm.org', 'mbuul.org', 'mbfpu.org', 'mbzcp.org', 'mbqgu.org',
-    'mbxma.org', 'mbeaj.org', 'mbrtz.org', 'mbhiz.org', 'mbopg.org', 'mbdny.org',
-    'mbznp.org', 'mbwnp.org', 'mbtmv.org', 'mbimg.org', 'mbmyj.org', 'mbtba.org',
-    'mprnm.org', 'mpubn.org', 'mpfip.org', 'mpmok.org', 'mpypl.org', 'mpizz.org',
-    'mpujj.org', 'mpvim.org', 'mpqom.org', 'mpqsc.org'
-  ];
-  const ROOT_PRIORITY_MB = [
-    'mbqgu.org', 'mbwbm.org', 'mbrtz.org', 'mbdny.org', 'mbopg.org', 'mbwnp.org',
-    'mbznp.org', 'mbfpu.org', 'mbmyj.org', 'mbwww.org', 'mbzcp.org', 'mbtmv.org',
-    'mbhiz.org', 'mbuul.org', 'mbxma.org', 'mbeaj.org', 'mbimg.org', 'mpizz.org',
-    'mbtba.org', 'mpfip.org', 'mpvim.org', 'mpmok.org', 'mpubn.org', 'mprnm.org',
-    'mpypl.org', 'mpqom.org', 'mpujj.org', 'mpqsc.org'
-  ];
+  const ROOT_PRIORITY_MP = `
+    mbwww.org mbwbm.org mbuul.org mbfpu.org mbzcp.org mbqgu.org mbxma.org mbeaj.org mbrtz.org mbhiz.org mbopg.org mbdny.org
+    mbznp.org mbwnp.org mbtmv.org mbimg.org mbmyj.org mbtba.org
+    mprnm.org mpubn.org mpfip.org mpmok.org mpypl.org mpizz.org mpujj.org mpvim.org mpqom.org mpqsc.org
+  `.trim().split(/\s+/);
 
-  const ALL_ROOTS = [
-    'mbdny.org', 'mbrtz.org', 'mbwbm.org', 'mbznp.org', 'mbqgu.org',
-    'mbtba.org', 'mbhiz.org', 'mbwnp.org', 'mbxma.org', 'mbwww.org', 'mbmyj.org',
-    'mbeaj.org', 'mbzcp.org', 'mbuul.org', 'mbtmv.org', 'mbimg.org', 'mbopg.org',
-    'mbfpu.org',
-    'mpfip.org', 'mpizz.org', 'mpmok.org', 'mpqom.org', 'mpqsc.org', 'mprnm.org',
-    'mpubn.org', 'mpujj.org', 'mpvim.org', 'mpypl.org'
-  ];
+  const ROOT_PRIORITY_MB = `
+    mbqgu.org mbwbm.org mbrtz.org mbdny.org mbopg.org mbwnp.org mbznp.org mbfpu.org mbmyj.org mbwww.org mbzcp.org mbtmv.org
+    mbhiz.org mbuul.org mbxma.org mbeaj.org mbimg.org mpizz.org mbtba.org mpfip.org mpvim.org mpmok.org mpubn.org mprnm.org
+    mpypl.org mpqom.org mpujj.org mpqsc.org
+  `.trim().split(/\s+/);
+
+  const ALL_ROOTS = `
+    mbdny.org mbrtz.org mbwbm.org mbznp.org mbqgu.org mbtba.org mbhiz.org mbwnp.org mbxma.org mbwww.org mbmyj.org
+    mbeaj.org mbzcp.org mbuul.org mbtmv.org mbimg.org mbopg.org mbfpu.org
+    mpfip.org mpizz.org mpmok.org mpqom.org mpqsc.org mprnm.org mpubn.org mpujj.org mpvim.org mpypl.org
+  `.trim().split(/\s+/);
   
   const SUBDOMAIN_RE = /^https?:\/\/([a-z]+)(\d{1,3})\.([a-z0-9\-]+)\.(org|net|to)(\/.*)$/i;
 
@@ -302,6 +578,76 @@
     };
   }
 
+  function isHostTuple(obj) {
+    return !!obj && typeof obj === 'object'
+      && typeof obj.prefix === 'string'
+      && typeof obj.number === 'number'
+      && typeof obj.root === 'string'
+      && typeof obj.tld === 'string';
+  }
+
+  function pathKeyOf(parsed) {
+    try {
+      return parsed.path.split('/').slice(0, 3).join('/');
+    } catch {
+      return '';
+    }
+  }
+
+  function serverCacheKey(parsed) {
+    return `${parsed.root}-${pathKeyOf(parsed)}`;
+  }
+
+  function tupleBase(tuple) {
+    return `https://${tuple.prefix}${String(tuple.number).padStart(2, '0')}.${tuple.root}.${tuple.tld}`;
+  }
+
+  function rememberOriginal(img, force = false) {
+    if (!img || !img.dataset) return;
+    if (force || !img.dataset.originalSrc) img.dataset.originalSrc = img.src;
+    if (img.srcset && (force || !img.dataset.originalSrcset)) img.dataset.originalSrcset = img.srcset;
+  }
+
+  function restoreOriginal(img) {
+    if (!img || !img.dataset || !img.dataset.originalSrc) return false;
+    img.src = img.dataset.originalSrc;
+    if (img.dataset.originalSrcset) img.srcset = img.dataset.originalSrcset;
+    return true;
+  }
+
+  function applyUrlAndSrcset(img, newUrl, newBase) {
+    img.referrerPolicy = 'no-referrer';
+    img.src = newUrl;
+    if (img.srcset) {
+      const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
+      if (newSrcset) img.srcset = newSrcset;
+    }
+  }
+
+  function commitPreemptiveDatasetWin(img, hostJson, badBase) {
+    try {
+      const tuple = safeJsonParse(hostJson);
+      if (!isHostTuple(tuple)) return null;
+
+      swarmHostMap.set(badBase, tuple);
+      const meta = persistentHostMeta.get(badBase);
+      if (meta) {
+        meta.host = tuple;
+        meta.lastUsed = nowMs();
+      } else {
+        persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
+      }
+
+      if (img.dataset.originalSrc) {
+        persistentUrlMeta.set(img.dataset.originalSrc, { fixedUrl: img.src, lastUsed: nowMs() });
+      }
+      schedulePersist();
+      return tuple;
+    } catch {
+      return null;
+    }
+  }
+
   function isMpRootLabel(rootLabel) {
     return typeof rootLabel === 'string' && rootLabel.startsWith('mp');
   }
@@ -506,7 +852,6 @@
 
   function generateCandidates(parsed) {
     const candidates = [];
-    const pathKey = parsed.path.split('/').slice(0, 3).join('/');
 
     const add = (p, n, r, t) => {
       candidates.push(`https://${p}${String(n).padStart(2, '0')}.${r}.${t}${parsed.path}`);
@@ -519,7 +864,7 @@
       return candidates;
     }
 
-    const cacheKey = `${parsed.root}-${pathKey}`;
+    const cacheKey = serverCacheKey(parsed);
     if (serverCache.has(cacheKey)) {
       const cached = serverCache.get(cacheKey);
       add(cached.prefix, cached.number, cached.root, cached.tld);
@@ -636,11 +981,10 @@
     if (img.dataset.batoMpFamilyPreemptive === 'true') return true;
     if (img.dataset.batoPreemptive === 'true') return false;
 
-    const newUrl = `https://${hostTuple.prefix}${String(hostTuple.number).padStart(2, '0')}.${hostTuple.root}.${hostTuple.tld}${parsed.path}`;
-    const newBase = `https://${hostTuple.prefix}${String(hostTuple.number).padStart(2, '0')}.${hostTuple.root}.${hostTuple.tld}`;
+    const newBase = tupleBase(hostTuple);
+    const newUrl = `${newBase}${parsed.path}`;
 
-    if (!img.dataset.originalSrc) img.dataset.originalSrc = img.src;
-    if (img.srcset && !img.dataset.originalSrcset) img.dataset.originalSrcset = img.srcset;
+    rememberOriginal(img);
 
     img.dataset.batoMpFamilyBadBase = badBase;
     if (!img.dataset.batoMpFamilyHost) {
@@ -652,12 +996,7 @@
       });
     }
 
-    img.referrerPolicy = 'no-referrer';
-    img.src = newUrl;
-    if (img.srcset) {
-      const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
-      if (newSrcset) img.srcset = newSrcset;
-    }
+    applyUrlAndSrcset(img, newUrl, newBase);
 
     img.dataset.batoMpFamilyPreemptive = 'true';
     setTimeout(() => checkImage(img), K_PREEMPTIVE_VERIFY_DELAY);
@@ -696,8 +1035,8 @@
     if (!parsed) return;
 
     const oldUrl = img.src;
-    const newUrl = `https://${hostTuple.prefix}${String(hostTuple.number).padStart(2, '0')}.${hostTuple.root}.${hostTuple.tld}${parsed.path}`;
-    const newBase = `https://${hostTuple.prefix}${String(hostTuple.number).padStart(2, '0')}.${hostTuple.root}.${hostTuple.tld}`;
+    const newBase = tupleBase(hostTuple);
+    const newUrl = `${newBase}${parsed.path}`;
     try {
       const badBase = toBase(parsed);
       swarmHostMap.set(badBase, hostTuple);
@@ -713,12 +1052,7 @@
       schedulePersist();
     } catch {
     }
-    img.src = newUrl;
-    img.referrerPolicy = 'no-referrer';
-    if (img.srcset) {
-      const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
-      if (newSrcset) img.srcset = newSrcset;
-    }
+    applyUrlAndSrcset(img, newUrl, newBase);
   }
 
   function applyKnownSwarmFixIfAny(img, parsed = null) {
@@ -729,8 +1063,7 @@
     const known = swarmHostMap.get(badBase);
     if (!known) return false;
 
-    if (!img.dataset.originalSrc) img.dataset.originalSrc = img.src;
-    if (img.srcset && !img.dataset.originalSrcset) img.dataset.originalSrcset = img.srcset;
+    rememberOriginal(img);
 
     img.dataset.batoSwarmPreemptive = 'true';
     img.dataset.batoFixing = 'true';
@@ -746,14 +1079,9 @@
     } catch {
     }
 
-    const newBase = `https://${known.prefix}${String(known.number).padStart(2, '0')}.${known.root}.${known.tld}`;
+    const newBase = tupleBase(known);
     const newUrl = `${newBase}${p.path}`;
-    img.referrerPolicy = 'no-referrer';
-    img.src = newUrl;
-    if (img.srcset) {
-      const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
-      if (newSrcset) img.srcset = newSrcset;
-    }
+    applyUrlAndSrcset(img, newUrl, newBase);
 
     img.dataset.batoFixing = 'done';
     img.dataset.batoFixed = 'true';
@@ -765,8 +1093,7 @@
     const meta = persistentUrlMeta.get(img.src);
     if (!meta || !meta.fixedUrl) return false;
 
-    if (!img.dataset.originalSrc) img.dataset.originalSrc = img.src;
-    if (img.srcset && !img.dataset.originalSrcset) img.dataset.originalSrcset = img.srcset;
+    rememberOriginal(img);
 
     img.dataset.batoUrlPreemptive = 'true';
     img.dataset.batoFixing = 'true';
@@ -777,12 +1104,7 @@
       fixedBase = new URL(fixed).origin;
     } catch {
     }
-    img.referrerPolicy = 'no-referrer';
-    img.src = fixed;
-    if (img.srcset) {
-      const newSrcset = fixedBase ? rewriteSrcsetToBase(img.srcset, fixedBase) : null;
-      if (newSrcset) img.srcset = newSrcset;
-    }
+    applyUrlAndSrcset(img, fixed, fixedBase);
 
     img.dataset.batoFixing = 'done';
     img.dataset.batoFixed = 'true';
@@ -837,6 +1159,11 @@
 
   async function leaderProbeAndSwarm(parsed) {
     const badBase = toBase(parsed);
+    const preflightTuple = await tryBestFullHostsPreflight(parsed, 4);
+    if (preflightTuple) {
+      return commitSwarmWin(badBase, preflightTuple, parsed, true);
+    }
+
     const candidates = generateCandidates(parsed);
     let lastError = null;
 
@@ -877,30 +1204,7 @@
           if (!successParsed) throw 'failed';
 
           const tuple = toHostTuple(successParsed);
-          swarmHostMap.set(badBase, tuple);
-
-          setMpFamilyWinner(tuple);
-          broadcastMpFamilyPreemptive(tuple);
-
-          const updatedImgs = broadcastSwarmFix(badBase, tuple);
-          for (const img of updatedImgs) {
-            setTimeout(() => checkImage(img), CHECK_DELAY);
-          }
-
-          setTimeout(() => {
-            try {
-              persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
-              schedulePersist();
-            } catch {
-            }
-            try {
-              const pathKey = parsed.path.split('/').slice(0, 3).join('/');
-              const cacheKey = `${parsed.root}-${pathKey}`;
-              serverCache.set(cacheKey, tuple);
-            } catch {
-            }
-          }, 0);
-          return tuple;
+          return commitSwarmWin(badBase, tuple, parsed);
         } catch (e) {
           lastError = e;
           for (const c of cancels) c();
@@ -933,32 +1237,7 @@
         if (!successParsed) continue;
 
         const tuple = toHostTuple(successParsed);
-        swarmHostMap.set(badBase, tuple);
-
-        if (isMpRootLabel(parsed.root)) {
-          setMpFamilyWinner(tuple);
-          broadcastMpFamilyPreemptive(tuple);
-        }
-
-        const updatedImgs = broadcastSwarmFix(badBase, tuple);
-        for (const img of updatedImgs) {
-          setTimeout(() => checkImage(img), CHECK_DELAY);
-        }
-
-        setTimeout(() => {
-          try {
-            persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
-            schedulePersist();
-          } catch {
-          }
-          try {
-            const pathKey = parsed.path.split('/').slice(0, 3).join('/');
-            const cacheKey = `${parsed.root}-${pathKey}`;
-            serverCache.set(cacheKey, tuple);
-          } catch {
-          }
-        }, 0);
-        return tuple;
+        return commitSwarmWin(badBase, tuple, parsed);
       } catch (e) {
         lastError = e;
         if (e === 'timeout' && i > 18) break;
@@ -1055,8 +1334,7 @@
     
     if (parsed.prefix !== 'k') return false;
     
-    const pathKey = parsed.path.split('/').slice(0, 3).join('/');
-    const cacheKey = `${parsed.root}-${pathKey}`;
+    const cacheKey = serverCacheKey(parsed);
     
     let newPrefix = 'n';
     let newNumber = parsed.number;
@@ -1074,17 +1352,10 @@
     const newBase = `https://${newPrefix}${String(newNumber).padStart(2, '0')}.${newRoot}.${newTld}`;
     const newUrl = `${newBase}${parsed.path}`;
     
-    img.dataset.originalSrc = img.src;
+    rememberOriginal(img, true);
     img.dataset.batoPreemptiveBadBase = toBase(parsed);
     img.dataset.batoPreemptiveHost = JSON.stringify({ prefix: newPrefix, number: newNumber, root: newRoot, tld: newTld });
-    img.referrerPolicy = 'no-referrer';
-    img.src = newUrl;
-    
-    if (img.srcset) {
-      img.dataset.originalSrcset = img.srcset;
-      const newSrcset = rewriteSrcsetToBase(img.srcset, newBase);
-      if (newSrcset) img.srcset = newSrcset;
-    }
+    applyUrlAndSrcset(img, newUrl, newBase);
     
     img.dataset.batoPreemptive = "true";
     return true;
@@ -1099,10 +1370,7 @@
         }
       } catch {
       }
-      if (img.dataset.originalSrc) {
-        img.src = img.dataset.originalSrc;
-        if (img.dataset.originalSrcset) img.srcset = img.dataset.originalSrcset;
-      }
+      restoreOriginal(img);
       img.dataset.batoUrlPreemptive = 'failed';
       img.dataset.batoFixing = '';
       fixImage(img);
@@ -1110,26 +1378,7 @@
     }
 
     if (img.dataset.batoSwarmPreemptive === 'true' && img.complete && img.naturalWidth > 0 && img.dataset.batoSwarmHost && img.dataset.batoSwarmBadBase) {
-      try {
-        const tuple = safeJsonParse(img.dataset.batoSwarmHost);
-        if (tuple && typeof tuple.prefix === 'string' && typeof tuple.number === 'number' && typeof tuple.root === 'string' && typeof tuple.tld === 'string') {
-          const badBase = img.dataset.batoSwarmBadBase;
-          swarmHostMap.set(badBase, tuple);
-          const meta = persistentHostMeta.get(badBase);
-          if (meta) {
-            meta.host = tuple;
-            meta.lastUsed = nowMs();
-          } else {
-            persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
-          }
-
-          if (img.dataset.originalSrc) {
-            persistentUrlMeta.set(img.dataset.originalSrc, { fixedUrl: img.src, lastUsed: nowMs() });
-          }
-          schedulePersist();
-        }
-      } catch {
-      }
+      commitPreemptiveDatasetWin(img, img.dataset.batoSwarmHost, img.dataset.batoSwarmBadBase);
       img.dataset.batoSwarmPreemptive = 'done';
       img.dataset.batoSwarmHost = '';
       img.dataset.batoSwarmBadBase = '';
@@ -1149,10 +1398,7 @@
         schedulePersist();
       } catch {
       }
-      if (img.dataset.originalSrc) {
-        img.src = img.dataset.originalSrc;
-        if (img.dataset.originalSrcset) img.srcset = img.dataset.originalSrcset;
-      }
+      restoreOriginal(img);
       img.dataset.batoSwarmPreemptive = 'failed';
       img.dataset.batoSwarmHost = '';
       img.dataset.batoSwarmBadBase = '';
@@ -1162,26 +1408,7 @@
     }
 
     if (img.dataset.batoMpFamilyPreemptive === 'true' && img.complete && img.naturalWidth > 0 && img.dataset.batoMpFamilyHost && img.dataset.batoMpFamilyBadBase) {
-      try {
-        const tuple = safeJsonParse(img.dataset.batoMpFamilyHost);
-        if (tuple && typeof tuple.prefix === 'string' && typeof tuple.number === 'number' && typeof tuple.root === 'string' && typeof tuple.tld === 'string') {
-          const badBase = img.dataset.batoMpFamilyBadBase;
-          swarmHostMap.set(badBase, tuple);
-          const meta = persistentHostMeta.get(badBase);
-          if (meta) {
-            meta.host = tuple;
-            meta.lastUsed = nowMs();
-          } else {
-            persistentHostMeta.set(badBase, { host: tuple, lastUsed: nowMs() });
-          }
-
-          if (img.dataset.originalSrc) {
-            persistentUrlMeta.set(img.dataset.originalSrc, { fixedUrl: img.src, lastUsed: nowMs() });
-          }
-          schedulePersist();
-        }
-      } catch {
-      }
+      commitPreemptiveDatasetWin(img, img.dataset.batoMpFamilyHost, img.dataset.batoMpFamilyBadBase);
       img.dataset.batoMpFamilyPreemptive = 'done';
       img.dataset.batoMpFamilyHost = '';
       img.dataset.batoMpFamilyBadBase = '';
@@ -1189,12 +1416,7 @@
     }
 
     if (img.dataset.batoMpFamilyPreemptive === 'true' && img.complete && img.naturalWidth === 0) {
-      if (img.dataset.originalSrc) {
-        img.src = img.dataset.originalSrc;
-        if (img.dataset.originalSrcset) {
-          img.srcset = img.dataset.originalSrcset;
-        }
-      }
+      restoreOriginal(img);
       img.dataset.batoMpFamilyPreemptive = 'failed';
       img.dataset.batoMpFamilyHost = '';
       img.dataset.batoMpFamilyBadBase = '';
@@ -1210,12 +1432,7 @@
     }
 
     if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth === 0) {
-      if (img.dataset.originalSrc) {
-        img.src = img.dataset.originalSrc;
-        if (img.dataset.originalSrcset) {
-          img.srcset = img.dataset.originalSrcset;
-        }
-      }
+      restoreOriginal(img);
       img.dataset.batoPreemptive = "failed";
       img.dataset.batoPreemptiveHost = '';
       img.dataset.batoPreemptiveBadBase = '';
@@ -1257,11 +1474,16 @@
     if (applyExactUrlFixIfAny(img)) return;
 
     if (applyKnownSwarmFixIfAny(img, parsed)) return;
+
+    // If it's still loading after a short delay, try a fast BEST_FULL_HOSTS preflight
+    // without waiting for the actual error event.
+    scheduleSlowLoadBestHostPreflight(img, parsed);
   }
 
   function init() {
     ensurePersistentCacheKey();
     loadPersistentCache();
+    loadBestHostStats();
     document.querySelectorAll('img').forEach(enqueueImage);
 
     const observer = new MutationObserver((mutations) => {
