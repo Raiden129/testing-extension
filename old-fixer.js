@@ -28,6 +28,16 @@
   
   const processingImages = new WeakSet();
 
+  function markInternalChange(img) {
+    try {
+      img.dataset.batoInternalChange = "1";
+      setTimeout(() => {
+        try { delete img.dataset.batoInternalChange; } catch { }
+      }, 0);
+    } catch {
+    }
+  }
+
   // 1. Parse URL
   function parseSubdomain(src) {
     const m = src.match(SUBDOMAIN_RE);
@@ -57,7 +67,12 @@
       let timedOut = false;
       const t = setTimeout(() => {
         timedOut = true;
-        img.src = "";
+        try {
+          img.onload = null;
+          img.onerror = null;
+          img.src = 'data:,';
+        } catch {
+        }
         failedCache.add(cacheKey);
         reject('timeout');
       }, timeout);
@@ -93,6 +108,10 @@
   }
 
   const ROOT_ENTRIES = ROOT_PRIORITY.map(rootEntry).filter(Boolean);
+
+  function exactCacheKey(parsed) {
+    return `${parsed.prefix}${String(parsed.number).padStart(2, '0')}.${parsed.root}.${parsed.tld}${parsed.path}`;
+  }
 
   function getPrefixOrder(parsed) {
     const seen = new Set();
@@ -132,7 +151,6 @@
   function generateCandidates(parsed) {
     const candidates = [];
     const seen = new Set();
-    const pathKey = parsed.path.split('/').slice(0, 3).join('/');
 
     const add = (p, n, r, t) => {
       const url = `https://${p}${String(n).padStart(2, '0')}.${r}.${t}${parsed.path}`;
@@ -141,7 +159,7 @@
       candidates.push(url);
     };
 
-    const cacheKey = `${parsed.root}-${pathKey}`;
+    const cacheKey = exactCacheKey(parsed);
     if (serverCache.has(cacheKey)) {
       const cached = serverCache.get(cacheKey);
       add(cached.prefix, cached.number, cached.root, cached.tld);
@@ -272,8 +290,7 @@
         //Cache the working server pattern
         const successParsed = parseSubdomain(url);
         if (successParsed) {
-          const pathKey = parsed.path.split('/').slice(0, 3).join('/');
-          const cacheKey = `${parsed.root}-${pathKey}`;
+          const cacheKey = exactCacheKey(parsed);
           serverCache.set(cacheKey, {
             prefix: successParsed.prefix,
             number: successParsed.number,
@@ -283,11 +300,13 @@
         }
         
         // Apply the fix
+        markInternalChange(img);
         img.referrerPolicy = "no-referrer";
         img.src = url;
         
         // Update srcset if it exists
         if (img.srcset) {
+          markInternalChange(img);
           const newSrcset = rewriteSrcset(img.srcset, url);
           if (newSrcset) img.srcset = newSrcset;
         }
@@ -330,31 +349,23 @@
     // Only preemptively fix k servers (most common issue)
     if (parsed.prefix !== 'k') return false;
     
-    // Check cache first
-    const pathKey = parsed.path.split('/').slice(0, 3).join('/');
-    const cacheKey = `${parsed.root}-${pathKey}`;
-    
-    let newPrefix = 'n'; // Default k→n fix
-    let newNumber = parsed.number;
-    let newRoot = parsed.root;
-    let newTld = parsed.tld;
-    
-    if (serverCache.has(cacheKey)) {
-      const cached = serverCache.get(cacheKey);
-      newPrefix = cached.prefix;
-      newNumber = cached.number;
-      newRoot = cached.root;
-      newTld = cached.tld;
-    }
+    // Preemptive swap should be deterministic: ONLY do k→n here.
+    // Cache is reserved for brute-force fixes.
+    const newPrefix = 'n';
+    const newNumber = parsed.number;
+    const newRoot = parsed.root;
+    const newTld = parsed.tld;
     
     const newUrl = `https://${newPrefix}${String(newNumber).padStart(2, '0')}.${newRoot}.${newTld}${parsed.path}`;
     
     img.dataset.originalSrc = img.src;
+    markInternalChange(img);
     img.referrerPolicy = "no-referrer";
     img.src = newUrl;
     
     if (img.srcset) {
       img.dataset.originalSrcset = img.srcset;
+      markInternalChange(img);
       const newSrcset = rewriteSrcset(img.srcset, newUrl);
       if (newSrcset) img.srcset = newSrcset;
     }
@@ -369,8 +380,10 @@
     if (img.dataset.batoPreemptive === "true" && img.complete && img.naturalWidth === 0) {
       // Preemptive fix failed, restore original and try full fix
       if (img.dataset.originalSrc) {
+        markInternalChange(img);
         img.src = img.dataset.originalSrc;
         if (img.dataset.originalSrcset) {
+          markInternalChange(img);
           img.srcset = img.dataset.originalSrcset;
         }
       }
@@ -396,15 +409,18 @@
       setTimeout(() => checkImage(img), 2000);
     }
     
-    // Add error handler
-    img.addEventListener('error', function() {
-      // Small delay to prevent race conditions
-      setTimeout(() => {
-        if (img.dataset.batoFixing !== "done") {
-          fixImage(img);
-        }
-      }, 100);
-    }, { once: false }); // Allow multiple error events
+    // Add error handler (only once per element)
+    if (img.dataset.batoHasErrorListener !== "true") {
+      img.dataset.batoHasErrorListener = "true";
+      img.addEventListener('error', function() {
+        // Small delay to prevent race conditions
+        setTimeout(() => {
+          if (img.dataset.batoFixing !== "done") {
+            fixImage(img);
+          }
+        }, 100);
+      });
+    }
   }
 
   // 9. Initialize
@@ -442,6 +458,10 @@
             mutation.target.tagName === 'IMG') {
           
           const img = mutation.target;
+          // Ignore attribute changes we caused ourselves (preemptive swap / final fix / rollback)
+          if (img.dataset && img.dataset.batoInternalChange === "1") {
+            return;
+          }
           // Reset fixing status if src changed and not by us
           if (img.dataset.batoFixing !== "done" && !img.dataset.batoFixed) {
             img.dataset.batoFixing = "";
