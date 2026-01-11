@@ -41,7 +41,7 @@
   ];
 
   const ALL_ROOTS = [
-    'mbdny.org', 'mbrtz.org', 'bato.to', 'mbwbm.org', 'mbznp.org', 'mbqgu.org',
+    'mbdny.org', 'mbrtz.org', 'mbwbm.org', 'mbznp.org', 'mbqgu.org',
     'mbtba.org', 'mbhiz.org', 'mbwnp.org', 'mbxma.org', 'mbwww.org', 'mbmyj.org',
     'mbeaj.org', 'mbzcp.org', 'mbuul.org', 'mbtmv.org', 'mbimg.org', 'mbopg.org',
     'mbfpu.org',
@@ -425,6 +425,7 @@
     }
 
     const img = new Image();
+    img.referrerPolicy = 'no-referrer';
     try {
       img.decoding = 'async';
       img.fetchPriority = 'low';
@@ -1255,11 +1256,7 @@
 
     if (applyExactUrlFixIfAny(img)) return;
 
-    const isThumbnail = img.src.includes('/thumb') || img.src.includes('/avatars');
-    
-    if (!isThumbnail) {                 
-      if (applyKnownSwarmFixIfAny(img, parsed)) return;
-    }
+    if (applyKnownSwarmFixIfAny(img, parsed)) return;
   }
 
   function init() {
